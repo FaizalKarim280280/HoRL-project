@@ -24,6 +24,7 @@ import numpy as np
 import viser
 
 from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+from cube_pick_common import resolve_camera
 from wrist_vision import INTRINSICS_FILE, BoardDetector, BoardSpec, Intrinsics, check_distortion
 
 VIEWS_FILE = INTRINSICS_FILE.with_name("wrist_intrinsics_views.npz")
@@ -114,7 +115,7 @@ def main() -> None:
         print(calibrate(obj_list, img_list, width, height, spec, args.full_model).replace("**", ""))
         return
     detector = BoardDetector(spec)
-    index = int(args.camera_index) if args.camera_index.isdigit() else args.camera_index
+    index = resolve_camera(args.camera_index)
     camera = OpenCVCamera(OpenCVCameraConfig(index_or_path=index, width=args.width, height=args.height, fps=args.fps))
 
     server = viser.ViserServer(port=args.viser_port)

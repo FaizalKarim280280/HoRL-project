@@ -24,6 +24,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", required=True)
     p.add_argument("--id", required=True)
     p.add_argument("--calib", type=Path, default=WRIST_CALIB_FILE)
+    p.add_argument(
+        "--camera-index", default=None,
+        help="Wrist camera: name (e.g. Innomaker) or index; default: the one stored in the calibration file",
+    )
     p.add_argument("--cube-size", type=float, default=0.025, help="Cube edge length (m)")
     p.add_argument("--grasp-z", type=float, default=None, help="Gripper frame height at grasp in the base frame (m); default table + 12 mm; tunable live")
     p.add_argument(
@@ -87,6 +91,8 @@ def main() -> None:
     if not args.calib.exists():
         raise FileNotFoundError(f"{args.calib} not found - run calibrate_wrist_handeye.py first.")
     cal = WristCalibration.load(args.calib)
+    if args.camera_index is not None:
+        cal.camera.index = args.camera_index
     k, dist = cal.intrinsics.k_mat, cal.intrinsics.dist_vec
     t_gripper_cam = np.array(cal.t_gripper_cam)
     scan_q = np.array(cal.scan_q)

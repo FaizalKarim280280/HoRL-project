@@ -33,6 +33,7 @@ from pynput import keyboard
 from viser.extras import ViserUrdf
 from viser.transforms import SO3
 
+from cube_pick_common import resolve_camera
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
@@ -149,7 +150,7 @@ def main() -> None:
 
     cameras = {}
     if args.camera_index.lower() != "none":
-        index = int(args.camera_index) if args.camera_index.isdigit() else args.camera_index
+        index = resolve_camera(args.camera_index)
         cameras[CAMERA_NAME] = OpenCVCameraConfig(
             index_or_path=index, width=args.camera_width, height=args.camera_height, fps=args.camera_fps
         )
