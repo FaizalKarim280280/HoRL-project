@@ -33,17 +33,14 @@ from pynput import keyboard
 from viser.extras import ViserUrdf
 from viser.transforms import SO3
 
-from cube_pick_common import resolve_camera
+from cube_pick_common import ALL_JOINTS, ARM_JOINTS, DEFAULT_URDF, resolve_camera
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.utils.keyboard_input import pynput_listener_is_trusted
 from lerobot.utils.robot_utils import precise_sleep
 
-ARM_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
-ALL_JOINTS = [*ARM_JOINTS, "gripper"]
 CAMERA_NAME = "front"
-DEFAULT_URDF = Path(__file__).resolve().parent.parent / "assets" / "SO101" / "so101_new_calib.urdf"
 
 # key -> (axis index, direction); axis 0..2 = x/y/z, axis 3 = gripper
 KEY_MAP = {
@@ -128,10 +125,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera-width", type=int, default=640)
     p.add_argument("--camera-height", type=int, default=480)
     p.add_argument("--camera-fps", type=int, default=30)
-    p.add_argument(
-        "--stereo-view", choices=["both", "left", "right"], default="both",
-        help="For side-by-side stereo cameras (e.g. ZED): which half of the frame to show",
-    )
     p.add_argument("--fps", type=int, default=30, help="Control loop rate")
     p.add_argument("--speed", type=float, default=0.05, help="End-effector speed in m/s")
     p.add_argument("--rot-speed", type=float, default=60.0, help="Gizmo rotation speed in deg/s")
@@ -331,13 +324,7 @@ def main() -> None:
             if t0 - last_ui > 0.1:  # GUI text + camera at ~10 Hz
                 last_ui = t0
                 if image_handle is not None and CAMERA_NAME in obs:
-                    frame = obs[CAMERA_NAME]
-                    half = frame.shape[1] // 2
-                    if args.stereo_view == "left":
-                        frame = frame[:, :half]
-                    elif args.stereo_view == "right":
-                        frame = frame[:, half:]
-                    image_handle.image = frame
+                    image_handle.image = obs[CAMERA_NAME]
                 joints_txt = " · ".join(f"{n}: {v:.1f}" for n, v in zip(ALL_JOINTS, q))
                 status_md.content = (
                     f"**{'SENDING' if sending else 'not sending (preview only)'}** · loop {loop_hz:.0f} Hz  \n"

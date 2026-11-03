@@ -60,7 +60,6 @@ def sample_poses(station: Station, scan_q: np.ndarray, n: int, min_height: float
     """Random joint perturbations around the scan pose that stay high and within limits,
     ordered to keep each move short. Every third pose uses a large wrist roll for diversity."""
     poses = []
-    limits = [station.joint_limits_deg[name] for name in ALL_JOINTS[:5]]
     tries = 0
     while len(poses) < n and tries < 50 * n:
         tries += 1
@@ -69,9 +68,7 @@ def sample_poses(station: Station, scan_q: np.ndarray, n: int, min_height: float
             offset[4] = np.sign(offset[4] or 1) * rng.uniform(25, 45)
         q = scan_q.copy()
         q[:5] += offset
-        if any(not (lo + 3 <= q[i] <= hi - 3) for i, (lo, hi) in enumerate(limits)):
-            continue
-        if station.kin.forward_kinematics(q)[2, 3] < min_height:
+        if not station.within_limits(q, 3) or station.kin.forward_kinematics(q)[2, 3] < min_height:
             continue
         poses.append(q)
     ordered, current = [], scan_q
@@ -210,16 +207,9 @@ def main() -> None:
             "all four image corners (or pass --ignore-intrinsics-check)."
         )
     detector = BoardDetector(spec)
-    camera = CameraSettings(args.camera_index, args.width, args.height, args.fps, "both")
+    camera = CameraSettings(args.camera_index, args.width, args.height, args.fps)
     station = Station(args.port, args.id, camera, DetectionSettings(), viser_port=args.viser_port, detect_red=False)
-
-    def overlay(view):
-        found = detector.detect(station.frame) if station.frame is not None else None
-        if found is not None:
-            detector.draw(view, *found)
-        return view
-
-    station.overlay = overlay
+    station.overlay = detector.overlay_for(station)
     station.connect()
     rng = np.random.default_rng(args.seed)
     try:

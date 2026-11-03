@@ -1,5 +1,5 @@
-"""Shared code for the red-cube scripts: robot + camera + viser station, red-cube detection,
-top-down inverse kinematics and smooth motions for the SO-101 follower."""
+"""Shared code for the wrist-camera scripts: robot + camera + viser station, red-cube detection,
+grasp poses, inverse kinematics and smooth motions for the SO-101 follower."""
 
 import json
 import math
@@ -7,7 +7,7 @@ import platform
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -22,12 +22,10 @@ from lerobot.model.kinematics import RobotKinematics
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.utils.robot_utils import precise_sleep
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent  # workspace root: src/, scripts/, assets/, calibration/, notebooks/, data/, lerobot/
+ROOT = Path(__file__).resolve().parent.parent  # workspace root: src/, scripts/, assets/, calibration/, notebooks/, data/, lerobot/
 ASSETS_DIR = ROOT / "assets"
 CALIB_DIR = ROOT / "calibration"
 DEFAULT_URDF = ASSETS_DIR / "SO101" / "so101_new_calib.urdf"
-DEFAULT_CALIB = CALIB_DIR / "cube_calibration.json"
 ARM_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 ALL_JOINTS = [*ARM_JOINTS, "gripper"]
 CAMERA_NAME = "cam"
@@ -37,6 +35,10 @@ CAMERA_NAME = "cam"
 # width along -x: for a 25 mm wide object, 12.5 mm. Same fingertip depth, so grasp heights are
 # still fingertip heights.
 DEFAULT_TCP_OFFSET = (-0.0125, 0.0, 0.0)
+# Speeds the motors actually reach (measured: wrist ~42 deg/s, gripper ~40 units/s). Commanding
+# faster just makes lerobot's max_relative_target limiter clamp every step (and warn).
+MAX_ROT_SPEED_DEG_S = 40.0
+GRIPPER_SPEED = 40.0  # gripper units (0..100) per second
 
 
 # --- camera selection -------------------------------------------------------------------------
@@ -83,10 +85,9 @@ def resolve_camera(spec: str) -> int | str:
 @dataclass
 class CameraSettings:
     index: str = "0"
-    width: int = 1344
-    height: int = 376
-    fps: int = 15
-    stereo_view: str = "left"  # for side-by-side stereo cameras (ZED): "left", "right" or "both"
+    width: int = 640
+    height: int = 480
+    fps: int = 30
 
 
 @dataclass
@@ -97,31 +98,6 @@ class DetectionSettings:
     s_min: int = 120
     v_min: int = 70
     min_area: int = 80  # pixels
-
-
-@dataclass
-class Calibration:
-    camera: CameraSettings = field(default_factory=CameraSettings)
-    detection: DetectionSettings = field(default_factory=DetectionSettings)
-    homography: list | None = None  # 3x3, pixel (u, v, 1) -> robot base (x, y, 1)
-    grasp_z: float = 0.012  # gripper_frame_link height when grasping (m)
-    hover_z: float = 0.08
-    gripper_open: float = 50.0
-    gripper_closed: float = 0.0
-    gripper_holding: float | None = None  # gripper reading when closed on the cube
-    park_q: list | None = None  # joint pose that keeps the arm out of the camera view
-    points: list = field(default_factory=list)  # [{"uv": [u, v], "xy": [x, y]}, ...]
-    fit_error_mm: float | None = None
-
-    def save(self, path: Path) -> None:
-        path.write_text(json.dumps(asdict(self), indent=2))
-
-    @classmethod
-    def load(cls, path: Path) -> "Calibration":
-        raw = json.loads(path.read_text())
-        raw["camera"] = CameraSettings(**raw["camera"])
-        raw["detection"] = DetectionSettings(**raw["detection"])
-        return cls(**raw)
 
 
 # --- detection --------------------------------------------------------------------------------
@@ -161,31 +137,8 @@ def detect_red_cube(rgb: np.ndarray, s: DetectionSettings) -> tuple[Detection | 
     return Detection(m["m10"] / m["m00"], m["m01"] / m["m00"], angle, area, contour), mask
 
 
-def pixel_to_robot(h: np.ndarray, u: float, v: float) -> np.ndarray:
-    p = h @ np.array([u, v, 1.0])
-    return p[:2] / p[2]
-
-
-def cube_yaw_in_robot(h: np.ndarray, det: Detection) -> float:
-    """Direction (rad) of one cube edge in the robot base frame, mapped through the homography."""
-    d = np.deg2rad(det.angle_deg)
-    a = pixel_to_robot(h, det.u, det.v)
-    b = pixel_to_robot(h, det.u + 15 * math.cos(d), det.v + 15 * math.sin(d))
-    return math.atan2(b[1] - a[1], b[0] - a[0])
-
-
 def wrap(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
-
-
-def choose_grasp_yaw(x: float, y: float, cube_yaw: float | None) -> float:
-    """Jaw-closing direction for a top-down grasp: aligned with a cube edge (cubes repeat every
-    90 deg), picking the option closest to the radial direction to keep the wrist roll small."""
-    radial = math.atan2(y, x)
-    if cube_yaw is None:
-        return radial
-    options = [cube_yaw + k * math.pi / 2 for k in range(-4, 5)]
-    return min(options, key=lambda a: abs(wrap(a - radial)))
 
 
 def topdown_pose(x: float, y: float, z: float, yaw: float) -> np.ndarray:
@@ -235,7 +188,6 @@ class Station:
         detect_red: bool = True,
         tcp_offset: tuple[float, float, float] = DEFAULT_TCP_OFFSET,
     ):
-        self.camera_settings = camera
         self.detect_red = detect_red
         self.overlay = None  # optional callable(rgb view) -> rgb view, drawn on the camera image
         index = resolve_camera(camera.index)
@@ -279,6 +231,12 @@ class Station:
                 "min_area": self.server.gui.add_slider("Min area (px)", 10, 5000, 10, detection.min_area),
             }
 
+        with self.server.gui.add_folder("Trajectories", expand_by_default=False):
+            self.show_traj = self.server.gui.add_checkbox("Show trajectories", initial_value=True)
+            self.server.gui.add_button("Clear trajectories").on_click(lambda _: self.clear_trajectories())
+        self._traj_handles: list[list] = []  # one list of scene handles per drawn move
+        self._traj_count = 0
+
         self.q = np.zeros(6)  # measured joints (deg, gripper 0..100)
         self.q_cmd = np.zeros(6)  # last commanded joints
         self.frame: np.ndarray | None = None
@@ -317,11 +275,6 @@ class Station:
         frame = obs.get(CAMERA_NAME)
         mask = None
         if frame is not None:
-            half = frame.shape[1] // 2
-            if self.camera_settings.stereo_view == "left":
-                frame = frame[:, :half]
-            elif self.camera_settings.stereo_view == "right":
-                frame = frame[:, half:]
             self.frame = np.ascontiguousarray(frame)
             if self.detect_red:
                 self.detection, mask = detect_red_cube(self.frame, self.detection_settings())
@@ -406,12 +359,11 @@ class Station:
         reached = self.tcp_pose(q)
         pos_err = np.linalg.norm(reached[:3, 3] - target[:3, 3])
         rot_err = np.rad2deg(np.linalg.norm(SO3.from_matrix(target[:3, :3].T @ reached[:3, :3]).log()))
-        in_limits = all(lo <= q[i] <= hi for i, (lo, hi) in enumerate(self.joint_limits_deg[n] for n in ARM_JOINTS))
-        return q if pos_err < 0.005 and rot_err < 5.0 and in_limits else None
+        return q if pos_err < 0.005 and rot_err < 5.0 and self.within_limits(q) else None
 
-    def solve_topdown(self, x: float, y: float, z: float, yaw: float, iters: int = 40) -> np.ndarray | None:
-        """Joint solution (deg) for a top-down pose, or None if it is out of reach."""
-        return self.solve_pose(topdown_pose(x, y, z, yaw), yaw, iters)
+    def within_limits(self, q: np.ndarray, margin_deg: float = 0.0) -> bool:
+        """All arm joints at least margin_deg inside their URDF limits."""
+        return all(lo + margin_deg <= q[i] <= hi - margin_deg for i, (lo, hi) in enumerate(self.joint_limits_deg[n] for n in ARM_JOINTS))
 
     # -- torque ------------------------------------------------------------------------------
 
@@ -426,39 +378,92 @@ class Station:
         self.robot.bus.enable_torque()
         self.q_cmd = self.q.copy()
 
+    # -- trajectory visualization ----------------------------------------------------------
+
+    TRAJ_COLORS = {"joint": (170, 60, 220), "cartesian": (255, 140, 0)}
+    MAX_TRAJECTORIES = 12
+
+    def clear_trajectories(self) -> None:
+        for handles in self._traj_handles:
+            for h in handles:
+                h.remove()
+        self._traj_handles.clear()
+
+    def draw_trajectory(self, poses: list[np.ndarray], kind: str) -> None:
+        """Shows the TCP poses a move will command: its path as a line and ~12 small frames along
+        it (position + orientation of the gripper)."""
+        if not self.show_traj.value or len(poses) < 2:
+            return
+        poses = np.asarray(poses)
+        pos = poses[:, :3, 3]
+        scene, name = self.server.scene, f"/traj/{self._traj_count}"
+        self._traj_count += 1
+        segments = np.stack([pos[:-1], pos[1:]], axis=1)
+        idx = np.unique(np.linspace(0, len(poses) - 1, min(12, len(poses))).astype(int))
+        handles = [
+            scene.add_line_segments(f"{name}/path", segments, self.TRAJ_COLORS[kind], thickness=3, thickness_units="screen"),
+            scene.add_batched_axes(
+                f"{name}/poses",
+                np.array([SO3.from_matrix(r).wxyz for r in poses[idx, :3, :3]]),
+                pos[idx],
+                axes_length=0.012,
+                axes_radius=0.001,
+            ),
+        ]
+        self._traj_handles.append(handles)
+        while len(self._traj_handles) > self.MAX_TRAJECTORIES:
+            for h in self._traj_handles.pop(0):
+                h.remove()
+
     # -- motion ------------------------------------------------------------------------------
 
     def send(self, q: np.ndarray) -> None:
         self.robot.send_action({f"{n}.pos": float(v) for n, v in zip(ALL_JOINTS, q)})
         self.q_cmd = np.array(q, dtype=float)
 
-    def joint_move(self, q_goal: np.ndarray, speed_deg_s: float = 40.0) -> None:
-        """Smooth joint-space move from the last command to q_goal (gripper included)."""
+    def joint_move(self, q_goal: np.ndarray, speed_deg_s: float = 30.0) -> None:
+        """Smooth joint-space move from the last command to q_goal (gripper included).
+
+        Every joint goes from its start to its goal angle along the same ease-in/ease-out
+        profile s(t) = 3t^2 - 2t^3, so all joints start and stop together; the duration is set by
+        the joint that has to move furthest. The gripper's path in space is whatever these joint
+        angles give (a curve, not a straight line)."""
         q_start = self.q_cmd.copy()
         span = np.max(np.abs(q_goal[:5] - q_start[:5]))
         steps = max(int(math.ceil(span / speed_deg_s / self.dt)), int(0.3 / self.dt))
+        profile = [3 * (i / steps) ** 2 - 2 * (i / steps) ** 3 for i in range(steps + 1)]
+        self.draw_trajectory([self.tcp_pose(q_start + (q_goal - q_start) * s) for s in profile], "joint")
         for i in range(1, steps + 1):
             t0 = time.perf_counter()
-            s = i / steps
-            s = 3 * s**2 - 2 * s**3  # ease in/out
-            self.send(q_start + (q_goal - q_start) * s)
+            self.send(q_start + (q_goal - q_start) * profile[i])
             self.tick()
             precise_sleep(max(self.dt - (time.perf_counter() - t0), 0.0))
         self._settle(q_goal)
 
     def cart_move(self, t_goal: np.ndarray, speed: float = 0.04) -> None:
-        """Straight-line move of the TCP to t_goal (orientation interpolated), via IK."""
+        """Straight-line move of the TCP to t_goal, via IK.
+
+        The TCP poses are planned first: position interpolated linearly from the current
+        commanded pose to the goal, orientation along the shortest rotation between them
+        (axis-angle, scaled by the same fraction), at constant speed (`speed` m/s, and at most
+        MAX_ROT_SPEED_DEG_S for the rotation). Each control step then solves IK for the next pose,
+        starting from the previous solution."""
         q_ik = self.q_cmd.copy()
         t_start = self.tcp_pose(q_ik)
         rot_delta = SO3.from_matrix(t_start[:3, :3].T @ t_goal[:3, :3]).log()
         dist = np.linalg.norm(t_goal[:3, 3] - t_start[:3, 3])
-        steps = max(int(math.ceil(dist / speed / self.dt)), int(math.ceil(np.linalg.norm(rot_delta) / math.radians(60) / self.dt)), 1)
-        for i in range(1, steps + 1):
-            t0 = time.perf_counter()
+        steps = max(int(math.ceil(dist / speed / self.dt)), int(math.ceil(np.linalg.norm(rot_delta) / math.radians(MAX_ROT_SPEED_DEG_S) / self.dt)), 1)
+        targets = []
+        for i in range(steps + 1):
             s = i / steps
             t = np.eye(4)
             t[:3, 3] = t_start[:3, 3] + (t_goal[:3, 3] - t_start[:3, 3]) * s
             t[:3, :3] = t_start[:3, :3] @ SO3.exp(rot_delta * s).as_matrix()
+            targets.append(t)
+        self.draw_trajectory(targets, "cartesian")
+        for i in range(1, steps + 1):
+            t0 = time.perf_counter()
+            t = targets[i]
             q_ik = self.kin.inverse_kinematics(q_ik, t @ self.t_tcp_flange, orientation_weight=0.1)
             self.send(q_ik)
             self.tick()
@@ -471,7 +476,8 @@ class Station:
     def set_gripper(self, value: float, seconds: float = 0.6) -> None:
         q_goal = self.q_cmd.copy()
         start = q_goal[5]
-        steps = max(int(seconds / self.dt), 1)
+        # never faster than the gripper can actually move (else the safety limiter clamps every step)
+        steps = max(int(seconds / self.dt), int(math.ceil(abs(value - start) / GRIPPER_SPEED / self.dt)), 1)
         for i in range(1, steps + 1):
             t0 = time.perf_counter()
             q_goal[5] = start + (value - start) * i / steps

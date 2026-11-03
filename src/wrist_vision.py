@@ -29,6 +29,20 @@ class BoardSpec:
         dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dictionary))
         return cv2.aruco.CharucoBoard((self.squares_x, self.squares_y), self.square_m, self.marker_m, dictionary)
 
+    @staticmethod
+    def add_args(p) -> None:
+        """--squares-x/--squares-y/--square-mm/--marker-mm/--dictionary (BOARD_ARGS in common.sh)."""
+        d = BoardSpec()
+        p.add_argument("--squares-x", type=int, default=d.squares_x, help="Board squares across")
+        p.add_argument("--squares-y", type=int, default=d.squares_y, help="Board squares down")
+        p.add_argument("--square-mm", type=float, default=d.square_m * 1000, help="Measured square size of the printed board")
+        p.add_argument("--marker-mm", type=float, default=d.marker_m * 1000, help="Measured marker size of the printed board")
+        p.add_argument("--dictionary", default=d.dictionary, help="ArUco dictionary of the board")
+
+    @classmethod
+    def from_args(cls, args) -> "BoardSpec":
+        return cls(args.squares_x, args.squares_y, args.square_mm / 1000, args.marker_mm / 1000, args.dictionary)
+
 
 def marker_detector_params() -> cv2.aruco.DetectorParameters:
     """ArUco settings for small markers on a low-resolution wrist camera.
@@ -84,6 +98,13 @@ class BoardDetector:
     def draw(view: np.ndarray, corners, ids) -> np.ndarray:
         cv2.aruco.drawDetectedCornersCharuco(view, corners, ids, (0, 255, 0))
         return view
+
+    def overlay_for(self, station):
+        """Station camera overlay that draws the detected board corners."""
+        def overlay(view):
+            found = self.detect(station.frame) if station.frame is not None else None
+            return self.draw(view, *found) if found is not None else view
+        return overlay
 
 
 def to_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:

@@ -20,7 +20,7 @@ import numpy as np
 
 from calibrate_wrist_handeye import sample_poses, save_and_show, wait_for_scan_pose
 from calibrate_wrist_intrinsics import as_object_array, calibrate
-from cube_pick_common import ALL_JOINTS, CameraSettings, DetectionSettings, Station
+from cube_pick_common import CameraSettings, DetectionSettings, Station
 from wrist_vision import WRIST_CALIB_FILE, BoardDetector, BoardSpec, Intrinsics, check_distortion
 
 PAN, FLEX, ROLL = 0, 3, 4
@@ -36,11 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--squares-x", type=int, default=5)
-    p.add_argument("--squares-y", type=int, default=7)
-    p.add_argument("--square-mm", type=float, default=30.0)
-    p.add_argument("--marker-mm", type=float, default=22.0)
-    p.add_argument("--dictionary", default="DICT_4X4_50")
+    BoardSpec.add_args(p)
     p.add_argument("--margin", type=float, default=0.18, help="How far into the corners to steer (fraction of image)")
     p.add_argument("--random-samples", type=int, default=12, help="Random poses to visit at least")
     p.add_argument("--target-views", type=int, default=30, help="Keep sampling random poses until this many views")
@@ -57,7 +53,6 @@ class AutoCapture:
         self.station, self.detector = station, detector
         self.scan_q = scan_q
         self.min_height = min_height
-        self.limits = [station.joint_limits_deg[n] for n in ALL_JOINTS[:5]]
         self.captures: list[dict] = []
         self.jacobian: np.ndarray | None = None  # d(board centroid px) / d(pan, flex deg)
 
@@ -66,9 +61,7 @@ class AutoCapture:
     def safe(self, q: np.ndarray) -> bool:
         if np.any(np.abs(q[:5] - self.scan_q[:5]) > MAX_OFFSET):
             return False
-        if any(not (lo + 3 <= q[i] <= hi - 3) for i, (lo, hi) in enumerate(self.limits)):
-            return False
-        return self.station.kin.forward_kinematics(q)[2, 3] >= self.min_height
+        return self.station.within_limits(q, 3) and self.station.kin.forward_kinematics(q)[2, 3] >= self.min_height
 
     def look(self, settle: float = 0.5):
         """Settles, then returns (corners, ids, centroid) or None."""
@@ -191,18 +184,11 @@ class AutoCapture:
 
 def main() -> None:
     args = parse_args()
-    spec = BoardSpec(args.squares_x, args.squares_y, args.square_mm / 1000, args.marker_mm / 1000, args.dictionary)
+    spec = BoardSpec.from_args(args)
     detector = BoardDetector(spec)
-    camera = CameraSettings(args.camera_index, args.width, args.height, args.fps, "both")
+    camera = CameraSettings(args.camera_index, args.width, args.height, args.fps)
     station = Station(args.port, args.id, camera, DetectionSettings(), viser_port=args.viser_port, detect_red=False)
-
-    def overlay(view):
-        found = detector.detect(station.frame) if station.frame is not None else None
-        if found is not None:
-            detector.draw(view, *found)
-        return view
-
-    station.overlay = overlay
+    station.overlay = detector.overlay_for(station)
     station.connect()
     rng = np.random.default_rng(args.seed)
     try:
