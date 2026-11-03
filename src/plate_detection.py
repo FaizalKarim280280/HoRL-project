@@ -36,7 +36,6 @@ class PlateDetection:
     corners: np.ndarray  # (4, 2) pixel corners of the plate outline
     contour: np.ndarray
     area: float
-    touches_border: bool = False  # outline reaches the image edge: part of the plate is out of view
 
 
 def plate_centre(outline_px: np.ndarray, to_table, size: float, angle_tol_deg: float = 15.0, length_tol: float = 0.15):
@@ -100,8 +99,9 @@ def blue_mask(rgb: np.ndarray, s: BlueSettings) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
-def detect_plate(rgb: np.ndarray, s: BlueSettings) -> tuple[PlateDetection | None, np.ndarray]:
-    """Largest blue region and its 4 corners, or None; plus the mask.
+def detect_plate(rgb: np.ndarray, s: BlueSettings, accept=None) -> tuple[PlateDetection | None, np.ndarray]:
+    """Largest blue region that `accept(contour)` agrees is the tray, and its 4 corners, or None;
+    plus the mask.
 
     The corners come from simplifying the region's convex outline to a quadrilateral (the
     plate's perspective-distorted square). If that does not give exactly 4 points (e.g. the
@@ -109,17 +109,13 @@ def detect_plate(rgb: np.ndarray, s: BlueSettings) -> tuple[PlateDetection | Non
     """
     mask = blue_mask(rgb, s)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    contours = [c for c in sorted(contours, key=cv2.contourArea, reverse=True) if cv2.contourArea(c) >= s.min_area]
+    contour = next((c for c in contours if accept is None or accept(c)), None)
+    if contour is None:
         return None, mask
-    contour = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(contour)
-    if area < s.min_area:
-        return None, mask
     hull = cv2.convexHull(contour)
     quad = cv2.approxPolyDP(hull, 0.03 * cv2.arcLength(hull, True), True).reshape(-1, 2)
     if len(quad) != 4:
         quad = cv2.boxPoints(cv2.minAreaRect(contour))
-    x, y, w, h = cv2.boundingRect(contour)
-    margin = 3
-    touches = x <= margin or y <= margin or x + w >= mask.shape[1] - margin or y + h >= mask.shape[0] - margin
-    return PlateDetection(quad.astype(np.float64), contour, area, touches), mask
+    return PlateDetection(quad.astype(np.float64), contour, area), mask

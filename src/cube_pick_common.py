@@ -122,16 +122,15 @@ def red_mask(rgb: np.ndarray, s: DetectionSettings) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
-def detect_red_cube(rgb: np.ndarray, s: DetectionSettings) -> tuple[Detection | None, np.ndarray]:
-    """Returns the largest red blob (or None) and the mask."""
+def detect_red_cube(rgb: np.ndarray, s: DetectionSettings, accept=None) -> tuple[Detection | None, np.ndarray]:
+    """Returns the largest red blob that `accept(contour)` agrees is the cube (or None), and the mask."""
     mask = red_mask(rgb, s)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    contours = [c for c in sorted(contours, key=cv2.contourArea, reverse=True) if cv2.contourArea(c) >= s.min_area]
+    contour = next((c for c in contours if accept is None or accept(c)), None)
+    if contour is None:
         return None, mask
-    contour = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(contour)
-    if area < s.min_area:
-        return None, mask
     m = cv2.moments(contour)
     (_, _), (_, _), angle = cv2.minAreaRect(contour)
     return Detection(m["m10"] / m["m00"], m["m01"] / m["m00"], angle, area, contour), mask
@@ -189,6 +188,7 @@ class Station:
         tcp_offset: tuple[float, float, float] = DEFAULT_TCP_OFFSET,
     ):
         self.detect_red = detect_red
+        self.cube_accept = None  # optional callable(contour) -> bool: is this red blob the cube?
         self.overlay = None  # optional callable(rgb view) -> rgb view, drawn on the camera image
         index = resolve_camera(camera.index)
         cams = {CAMERA_NAME: OpenCVCameraConfig(index_or_path=index, width=camera.width, height=camera.height, fps=camera.fps)}
@@ -277,7 +277,7 @@ class Station:
         if frame is not None:
             self.frame = np.ascontiguousarray(frame)
             if self.detect_red:
-                self.detection, mask = detect_red_cube(self.frame, self.detection_settings())
+                self.detection, mask = detect_red_cube(self.frame, self.detection_settings(), self.cube_accept)
             else:
                 self.detection, mask = None, None
 

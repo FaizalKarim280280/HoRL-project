@@ -122,10 +122,12 @@ class StageOutline:
         self.md.content = "  \n".join(lines) + (f"\n\n{self.footer}" if self.footer else "")
 
 
-def find_search_poses(station: Station, t_gripper_cam: np.ndarray, scan_q: np.ndarray, table_z: float) -> list[np.ndarray]:
-    """Wider views for when the object is not visible from the scan pose: the highest camera
-    position (shoulder/elbow/wrist offsets from the scan pose) that still looks down at the
-    same area (within 4 cm), then the same view panned left and right."""
+def find_search_poses(station: Station, t_gripper_cam: np.ndarray, scan_q: np.ndarray, table_z: float,
+                      pan_range: float = 60.0, pan_step: float = 20.0) -> tuple[np.ndarray, list[np.ndarray]]:
+    """The high view: the highest camera position (shoulder/elbow/wrist offsets from the scan
+    pose) that still looks down at the same area (within 4 cm), so more of the table is visible.
+    Plus the sweep: that view panned from the robot's left to its right in pan_step steps up to
+    +-pan_range (views outside the joint limits are skipped)."""
     def view(q):
         cam = station.kin.forward_kinematics(q) @ t_gripper_cam
         axis = cam[:3, 2]  # optical axis
@@ -148,13 +150,13 @@ def find_search_poses(station: Station, t_gripper_cam: np.ndarray, scan_q: np.nd
                 if v and abs(v[1] - look_r) <= 0.04 and v[0] > best_h + 0.02:
                     best, best_h = q, v[0]
     high = best if best is not None else scan_q
-    poses = [high] if best is not None else []
-    for d_pan in (35.0, -35.0):  # positive pan turns the arm toward -y
+    poses = []
+    for d_pan in np.arange(-pan_range, pan_range + 1e-9, pan_step):  # positive pan turns the arm toward -y (right)
         q = high.copy()
         q[0] += d_pan
         if station.within_limits(q, 5):
             poses.append(q)
-    return poses
+    return high, poses
 
 
 def main() -> None:
@@ -179,15 +181,16 @@ def main() -> None:
     station = Station(args.port, args.id, cal.camera, cal.detection, viser_port=args.viser_port)
     gui = station.server.gui
     outline = StageOutline(gui, on_end=station.clear_trajectories)
-    pick, put_back, rescan, search = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+    pick, put_back, rescan, search, go_high = (threading.Event() for _ in range(5))
     with gui.add_folder("Pick"):
         gui.add_button("Pick & place", color="green").on_click(lambda _: pick.set())
         place_box = gui.add_checkbox("Place on blue plate", initial_value=True)
-        gui.add_button("Search wider").on_click(lambda _: search.set())
-        auto_search = gui.add_checkbox("Auto-search on Pick if not visible", initial_value=True)
+        gui.add_button("Sweep for cube & tray").on_click(lambda _: search.set())
+        auto_search = gui.add_checkbox("Sweep on Pick if not visible", initial_value=True)
         put_back_btn = gui.add_button("Put back", disabled=True)
         put_back_btn.on_click(lambda _: put_back.set())
         gui.add_button("Back to scan pose").on_click(lambda _: rescan.set())
+        gui.add_button("High view (see more)").on_click(lambda _: go_high.set())
         # Start high and lower in ~10 mm steps until the fingertips reach the cube: a too-high
         # grasp just misses, a too-low one would push the fingers into the table.
         height_mm = gui.add_slider("Grasp height (mm, base frame)", -80, 40, 1, round(args.grasp_z * 1000))
@@ -266,7 +269,8 @@ def main() -> None:
             follow_gripper()
         if station.frame is None:
             return view
-        det, mask = detect_plate(station.frame, blue_settings())
+        blob_size["tray"] = None
+        det, mask = detect_plate(station.frame, blue_settings(), tray_ok)
         plate_seen["det"] = det
         view[mask > 0] = (0.5 * view[mask > 0] + [0, 0, 127]).astype(np.uint8)
         if det is not None:
@@ -302,33 +306,18 @@ def main() -> None:
             centre, yaw, method = pts.mean(axis=0), math.atan2(edge[1], edge[0]), "fitted quad (fallback)"
         plate_seen["method"] = method
         cx, cy = np.asarray(centre) + np.asarray(plate_offset)
-        return float(cx), float(cy), float(yaw), side, method
-
-    TRUSTED_METHODS = ("4 corners", "diagonal")
+        return float(cx), float(cy), float(yaw), side
 
     def measure_plate(frames: int = 6) -> tuple[float, float, float, float] | None:
-        """Median plate estimate over several frames at the current arm pose - from views that show
-        enough of the tray only. A frame is used only if the tray's outline does not touch the image
-        border (else part of it is out of view) and its centre came from all 4 real corners or a
-        full diagonal (else the gripper, the held cube or the image edge hides too much). A partial
-        view returns None, so it never replaces an earlier good estimate."""
-        found, partial = [], 0
+        """Median plate estimate over several frames at the current arm pose."""
+        found = []
         for _ in range(frames):
             station.idle(station.dt)
-            det, _ = detect_plate(station.frame, blue_settings()) if station.frame is not None else (None, None)
-            if det is None:
-                continue
-            if det.touches_border:
-                partial += 1
-                continue
-            loc = locate_plate(det)
-            if loc is None or loc[4] not in TRUSTED_METHODS:
-                partial += 1
-                continue
-            found.append(loc)
+            det, _ = detect_plate(station.frame, blue_settings(), tray_ok) if station.frame is not None else (None, None)
+            loc = locate_plate(det) if det is not None else None
+            if loc is not None:
+                found.append(loc)
         if len(found) < frames // 2:
-            if partial:
-                print(f"Tray only partly visible from here ({partial}/{frames} frames) - not using this view.")
             return None
         x, y = float(np.median([f[0] for f in found])), float(np.median([f[1] for f in found]))
         yaw = math.atan2(np.mean([math.sin(4 * f[2]) for f in found]), np.mean([math.cos(4 * f[2]) for f in found])) / 4
@@ -337,6 +326,46 @@ def main() -> None:
         print(f"Plate centre ({x:.3f}, {y:.3f}) m from {plate_seen.get('method', '?')}, yaw {math.degrees(yaw):.0f} deg, measured edge {side * 100:.1f} cm "
               f"(expected {args.plate_size * 100:.1f})")
         return x, y, yaw, side
+
+    def footprint(contour: np.ndarray, plane_z: float) -> tuple[float, float] | None:
+        """Long and short side (m) of a blob's outline projected onto the plane z = plane_z,
+        at the current arm pose: its real size on the table, whatever the camera distance."""
+        px = contour.reshape(-1, 2).astype(np.float64)
+        px = px[np.linspace(0, len(px) - 1, min(len(px), 48)).astype(int)]
+        t_base_cam = station.kin.forward_kinematics(station.q) @ t_gripper_cam
+        n = cv2.undistortPoints(px.reshape(-1, 1, 2), k, dist).reshape(-1, 2)
+        rays = np.column_stack([n, np.ones(len(n))]) @ t_base_cam[:3, :3].T
+        if np.any(rays[:, 2] > -1e-6):
+            return None  # some ray does not go down to the table
+        pts = t_base_cam[:3, 3] + rays * ((plane_z - t_base_cam[2, 3]) / rays[:, 2])[:, None]
+        (_, _), (w, h), _ = cv2.minAreaRect((pts[:, :2] * 1000).astype(np.float32))  # in mm for precision
+        return max(w, h) / 1000, min(w, h) / 1000
+
+    def cube_ok(contour: np.ndarray) -> bool:
+        """The red blob has the cube's size. Seen at an angle, its sides make it look up to
+        about 2x longer than the top face."""
+        fp = footprint(contour, cube_top_z)
+        return fp is not None and fp[1] >= 0.6 * args.cube_size and fp[0] <= 2.2 * args.cube_size
+
+    blob_size: dict = {"tray": None}  # measured size of the largest blue blob, for the status line
+
+    def tray_ok(contour: np.ndarray) -> bool:
+        """The blue blob is roughly the tray's size. Loose on purpose: the tray's outer walls,
+        and any error in the table height, make it measure larger than 10 cm; this only rejects
+        things clearly too small or too big. If it is cut by the image edge, only a minimum."""
+        fp = footprint(contour, plate_top_z)
+        if fp is None or station.frame is None:
+            return False
+        x, y, w, h = cv2.boundingRect(contour)
+        height, width = station.frame.shape[:2]
+        cut = x <= 3 or y <= 3 or x + w >= width - 3 or y + h >= height - 3
+        size = args.plate_size
+        ok = fp[0] <= 1.8 * size and fp[1] >= (0.25 if cut else 0.5) * size
+        if blob_size["tray"] is None:  # the largest blob is checked first
+            blob_size["tray"] = (fp, ok)
+        return ok
+
+    station.cube_accept = cube_ok
 
     def locate(det: Detection) -> tuple[float, float, float] | None:
         """Object (x, y, edge direction) in the base frame from a detection at the current arm pose."""
@@ -422,8 +451,16 @@ def main() -> None:
 
     def preview() -> None:
         preview_cube()
-        plate_line = ("Blue plate: **seen**" if plate_seen["det"] is not None else
-                      "Blue plate: **not seen** (tune *Blue detection* if it is in view)") if place_box.value else ""
+        measured = blob_size["tray"]
+        size_txt = f" - measures {measured[0][0] * 100:.1f} x {measured[0][1] * 100:.1f} cm" if measured else ""
+        if not place_box.value:
+            plate_line = ""
+        elif plate_seen["det"] is not None:
+            plate_line = f"Blue plate: **seen**{size_txt}"
+        elif measured:
+            plate_line = f"Blue region{size_txt}, **not counted as the tray** (expected about {args.plate_size * 100:.0f} cm)"
+        else:
+            plate_line = "Blue plate: **not seen** (tune *Blue detection* if it is in view)"
         station.status_md.content += "  \n" + plate_line
 
     def preview_cube() -> None:
@@ -456,67 +493,126 @@ def main() -> None:
         station.idle(0.5)
         cache["uv"] = None
 
-    search_poses = find_search_poses(station, t_gripper_cam, scan_q, table_z)
-    print(f"{len(search_poses)} wider search views prepared")
+    high_q, sweep_poses = find_search_poses(station, t_gripper_cam, scan_q, table_z, pan_range=60.0, pan_step=15.0)
+    print(f"Sweep: {len(sweep_poses)} views from left to right")
+    # Direction the scan pose looks in (from the base): panning the base turns the view by the same angle.
+    scan_cam = station.kin.forward_kinematics(scan_q) @ t_gripper_cam
+    scan_look = scan_cam[:3, 3] + scan_cam[:3, 2] * (table_z - scan_cam[2, 3]) / scan_cam[2, 2]
+    scan_look_angle = math.atan2(scan_look[1], scan_look[0])
 
-    def search_wider(look=None, what: str = "cube"):
-        """Visits the wider views until `look()` finds the object; stays there if found."""
-        look = look or station.average_detection
-        for i, q in enumerate(search_poses, 1):
-            station.set_status(f"Searching wider for the {what}: view {i}/{len(search_poses)}...")
+    def best_cluster(found: list[tuple]) -> tuple | None:
+        """The position seen most often (sightings within 3 cm of each other agree): median x, y."""
+        if not found:
+            return None
+        xy = np.array([f[:2] for f in found])
+        votes = [np.sum(np.hypot(*(xy - p).T) < 0.03) for p in xy]
+        i = int(np.argmax(votes))
+        near = np.hypot(*(xy - xy[i]).T) < 0.03
+        return (float(np.median(xy[near, 0])), float(np.median(xy[near, 1])), *found[i][2:])
+
+    def sweep(want_cube: bool, want_tray: bool) -> tuple[tuple | None, tuple | None]:
+        """Pans from the robot's left to its right through the sweep views and records every
+        sighting of the cube and/or tray (only blobs with their real size count), stopping as soon
+        as everything wanted has been seen. Returns the position seen most often for each, or None."""
+        cubes, trays = [], []
+        for i, q in enumerate(sweep_poses, 1):
+            seen = ", ".join(f"{name} {'seen' if found else 'not seen yet'}" for name, want, found in
+                             (("cube", want_cube, cubes), ("tray", want_tray, trays)) if want)
+            station.set_status(f"Sweeping left to right ({i}/{len(sweep_poses)}): {seen}")
             q = q.copy()
             q[5] = station.q_cmd[5]
-            station.joint_move(q, speed_deg_s=30)
-            found = look()
-            if found is not None:
-                cache["uv"] = None
-                station.set_status(f"**Found** the {what} from search view {i}.")
-                return found
-        station.set_status(f"**No {what} found** from any search view. Move it into the workspace and try again.")
-        go_scan()
-        return None
+            station.joint_move(q, speed_deg_s=20)
+            station.idle(0.2)
+            if want_cube:
+                det = station.average_detection(6)
+                where = locate(det) if det is not None else None
+                if where is not None:
+                    cubes.append(where)
+            if want_tray:
+                tray = measure_plate(frames=4)
+                if tray is not None:
+                    trays.append(tray)
+            if (cubes or not want_cube) and (trays or not want_tray):
+                print(f"Sweep: everything found by view {i}/{len(sweep_poses)}, stopping.")
+                break
+        cache["uv"] = None
+        return best_cluster(cubes), best_cluster(trays)
+
+    def look_at(x: float, y: float) -> bool:
+        """Turns the scan pose towards (x, y) by panning the base, for a sharper look."""
+        q = scan_q.copy()
+        q[0] -= math.degrees(wrap(math.atan2(y, x) - scan_look_angle))  # positive pan turns the arm toward -y
+        q[5] = station.q_cmd[5]
+        if not station.within_limits(q, 5):
+            return False
+        station.joint_move(q, speed_deg_s=30)
+        station.idle(0.4)
+        cache["uv"] = None
+        return True
 
     station.connect()
     try:
         station.set_gripper(args.gripper_open)
         go_scan()
         while True:
-            event = station.wait_for(pick, rescan, search, on_tick=preview)
+            event = station.wait_for(pick, rescan, search, go_high, on_tick=preview)
             if event is rescan:
                 go_scan()
                 continue
+            if event is go_high:  # stays there; Pick & place looks from here, Back to scan pose returns
+                q = high_q.copy()
+                q[5] = station.q_cmd[5]
+                station.joint_move(q, speed_deg_s=30)
+                cache["uv"] = None
+                continue
             if event is search:
-                search_wider()
+                cube_found, tray_found = sweep(True, place_box.value)
+                go_scan()
+                station.set_status("Sweep: " + "; ".join(
+                    f"{name} {'at (%.3f, %.3f) m' % f[:2] if f else 'not found'}"
+                    for name, f in (("cube", cube_found), ("tray", tray_found)) if name == "cube" or place_box.value))
                 continue
             station.clear_trajectories()  # draw this pick-and-place's moves on a clean slate
             outline.begin(PLACE_STAGES if place_box.value else HOLD_STAGES)
-            plate = None
+            plate, where = None, None
             if place_box.value:  # find the plate first, so we never pick up a cube we cannot place
                 outline.step("Find tray")
                 plate = measure_plate()
-                if plate is None and auto_search.value:
-                    plate = search_wider(measure_plate, "blue plate")
-                    if plate is not None:
-                        go_scan()  # look for the cube from the normal scan pose again
+            det = station.average_detection()
+            where = locate(det) if det is not None else None
+            need_tray, need_cube = place_box.value and plate is None, where is None
+            if (need_tray or need_cube) and auto_search.value:
+                cube_found, tray_found = sweep(need_cube, need_tray)
+                if need_tray and tray_found is not None:
+                    plate = (measure_plate() if look_at(*tray_found[:2]) else None) or tray_found
+                if need_cube and cube_found is not None:
+                    det = station.average_detection() if look_at(*cube_found[:2]) else None
+                    where = (locate(det) if det is not None else None) or cube_found
+                if where is None or not need_cube:
+                    go_scan()
+            if place_box.value:
                 if plate is None:
-                    station.set_status("**No full view of the blue tray.** Put the whole tray in view (or tune *Blue detection*), "
-                                       "or untick *Place on blue plate*.")
-                    outline.fail("no full view of the blue tray (it must not touch the image edge)")
+                    station.set_status(f"**No blue tray found** (looking for a {args.plate_size * 100:.0f} cm square). "
+                                       "Put it in reach (or tune *Blue detection*), or untick *Place on blue plate*.")
+                    outline.fail("no blue tray found")
                     continue
                 if plan_place(plate[0], plate[1], plate[2]) is None:
-                    station.set_status(f"Plate at ({plate[0]:.3f}, {plate[1]:.3f}) is out of reach for placing - move it closer.")
+                    station.set_status(f"**Tray out of reach** at {np.hypot(plate[0], plate[1]) * 100:.0f} cm from the base "
+                                       "- move it to 10-28 cm.")
                     outline.fail("tray out of reach")
                     continue
                 outline.note("Find tray", f"({plate[0]:.3f}, {plate[1]:.3f}) m")
             outline.step("Find cube")
-            det = station.average_detection()
-            if det is None and auto_search.value:
-                det = search_wider()
-            where = locate(det) if det is not None else None
-            plan = plan_grasp(*where) if where is not None else None
+            if where is None:
+                station.set_status(f"**No red cube found** (looking for a {args.cube_size * 1000:.0f} mm cube). "
+                                   "Put it in reach (or tune *Red detection*).")
+                outline.fail("no red cube found")
+                continue
+            plan = plan_grasp(*where)
             if plan is None:
-                station.set_status("Object not detected reliably, or no grasp found - try again.")
-                outline.fail("cube not found, or no reachable grasp")
+                station.set_status(f"**Cube out of reach** at {np.hypot(where[0], where[1]) * 100:.0f} cm from the base "
+                                   "(no grasp even tilted 30 deg) - move it to 10-28 cm.")
+                outline.fail("cube out of reach")
                 continue
             outline.note("Find cube", f"({plan['x']:.3f}, {plan['y']:.3f}) m")
             outline.step("Move above cube")
@@ -605,9 +701,9 @@ def main() -> None:
                     for _ in range(2):  # close-up look at the tray: errors from the far scan view shrink
                         station.idle(0.4)
                         close = measure_plate()
-                        if close is None or not (0.85 <= close[3] / args.plate_size <= 1.15) \
+                        if close is None or not (0.7 <= close[3] / args.plate_size <= 1.3) \
                                 or np.hypot(close[0] - plate[0], close[1] - plate[1]) > 0.05:
-                            print("Tray close-up not usable (not fully visible from here); keeping the scan estimate.")
+                            print("Tray close-up not usable (not fully visible from here); keeping the previous estimate.")
                             break
                         new_place = place_at(close)
                         if new_place is None:
