@@ -342,10 +342,11 @@ def main() -> None:
         return max(w, h) / 1000, min(w, h) / 1000
 
     def cube_ok(contour: np.ndarray) -> bool:
-        """The red blob has the cube's size. Seen at an angle, its sides make it look up to
-        about 2x longer than the top face."""
+        """The red blob is roughly the cube's size. Seen at a slant (e.g. from the high or sweep
+        views), its sides make it look up to ~3x longer than the top face; this only rejects
+        things clearly too small or too big."""
         fp = footprint(contour, cube_top_z)
-        return fp is not None and fp[1] >= 0.6 * args.cube_size and fp[0] <= 2.2 * args.cube_size
+        return fp is not None and fp[1] >= 0.5 * args.cube_size and fp[0] <= 3.0 * args.cube_size
 
     blob_size: dict = {"tray": None}  # measured size of the largest blue blob, for the status line
 
@@ -512,8 +513,9 @@ def main() -> None:
 
     def sweep(want_cube: bool, want_tray: bool) -> tuple[tuple | None, tuple | None]:
         """Pans from the robot's left to its right through the sweep views and records every
-        sighting of the cube and/or tray (only blobs with their real size count), stopping as soon
-        as everything wanted has been seen. Returns the position seen most often for each, or None."""
+        sighting of the cube and/or tray (only blobs with their real size count). It stops early
+        only once every wanted object has been seen during this sweep; otherwise it goes through
+        all views. Returns the position seen most often for each, or None."""
         cubes, trays = [], []
         for i, q in enumerate(sweep_poses, 1):
             seen = ", ".join(f"{name} {'seen' if found else 'not seen yet'}" for name, want, found in
@@ -522,9 +524,9 @@ def main() -> None:
             q = q.copy()
             q[5] = station.q_cmd[5]
             station.joint_move(q, speed_deg_s=20)
-            station.idle(0.2)
+            station.idle(0.5)  # let the camera catch up with the arm
             if want_cube:
-                det = station.average_detection(6)
+                det = station.average_detection(10, min_frac=0.4)
                 where = locate(det) if det is not None else None
                 if where is not None:
                     cubes.append(where)
@@ -532,9 +534,15 @@ def main() -> None:
                 tray = measure_plate(frames=4)
                 if tray is not None:
                     trays.append(tray)
+            print(f"Sweep view {i}/{len(sweep_poses)}: " + ", ".join(
+                f"{name} {len(found)} sighting(s)" for name, want, found in (("cube", want_cube, cubes), ("tray", want_tray, trays)) if want))
             if (cubes or not want_cube) and (trays or not want_tray):
-                print(f"Sweep: everything found by view {i}/{len(sweep_poses)}, stopping.")
+                print("Sweep: " + " and ".join(n for n, w in (("cube", want_cube), ("tray", want_tray)) if w) + " seen, stopping early.")
                 break
+        else:
+            missing = [n for n, w, f in (("cube", want_cube, cubes), ("tray", want_tray, trays)) if w and not f]
+            if missing:
+                print(f"Sweep: went through all {len(sweep_poses)} views; never saw the {' or the '.join(missing)}.")
         cache["uv"] = None
         return best_cluster(cubes), best_cluster(trays)
 
@@ -582,7 +590,7 @@ def main() -> None:
             where = locate(det) if det is not None else None
             need_tray, need_cube = place_box.value and plate is None, where is None
             if (need_tray or need_cube) and auto_search.value:
-                cube_found, tray_found = sweep(need_cube, need_tray)
+                cube_found, tray_found = sweep(True, place_box.value)  # always both: stops only once both are seen
                 if need_tray and tray_found is not None:
                     plate = (measure_plate() if look_at(*tray_found[:2]) else None) or tray_found
                 if need_cube and cube_found is not None:
@@ -604,7 +612,8 @@ def main() -> None:
                 outline.note("Find tray", f"({plate[0]:.3f}, {plate[1]:.3f}) m")
             outline.step("Find cube")
             if where is None:
-                station.set_status(f"**No red cube found** (looking for a {args.cube_size * 1000:.0f} mm cube). "
+                station.set_status(f"**No red cube found** (looking for a {args.cube_size * 1000:.0f} mm cube) from the scan pose"
+                                   f"{' or in any of the ' + str(len(sweep_poses)) + ' sweep views' if auto_search.value else ''}. "
                                    "Put it in reach (or tune *Red detection*).")
                 outline.fail("no red cube found")
                 continue

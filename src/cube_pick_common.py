@@ -323,14 +323,14 @@ class Station:
                     return e
             precise_sleep(max(self.dt - (time.perf_counter() - t0), 0.0))
 
-    def average_detection(self, ticks: int = 10) -> Detection | None:
-        """Median of several detections, or None if the cube was seen in fewer than 60% of frames."""
+    def average_detection(self, ticks: int = 10, min_frac: float = 0.6) -> Detection | None:
+        """Median of several detections, or None if the cube was seen in fewer than min_frac of the frames."""
         found = []
         for _ in range(ticks):
             self.idle(self.dt)
             if self.detection is not None:
                 found.append(self.detection)
-        if len(found) < 0.6 * ticks:
+        if len(found) < max(1, min_frac * ticks):
             return None
         best = found[-1]
         return Detection(
