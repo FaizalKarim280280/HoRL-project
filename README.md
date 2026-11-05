@@ -7,7 +7,7 @@ An SO-101 arm finds a red cube with its wrist camera, picks it up and drops it i
 | `lerobot/` | LeRobot repository, installed in editable mode |
 | `scripts/` | Launchers, plus `common.sh` with all machine-specific settings |
 | `src/` | Python code used by the launchers |
-| `calibration/` | Camera calibration, colour settings, learned place correction |
+| `calibration/` | Camera calibration and colour settings |
 | `assets/` | SO-101 URDF and meshes |
 | `notebooks/` | ChArUco and colour detection on a single image |
 
@@ -58,7 +58,7 @@ Put the cube and the tray 10–28 cm from the base. The whole tray must be in vi
 4. Lower the cube and drop it.
 5. Check where it landed.
 
-Each landing updates the learned correction (**Reset place correction** clears it). The 3D view shows the robot, the cube and tray models, and the planned paths (purple = joint moves, orange = straight-line moves).
+After each drop it reports how far from the tray centre the cube landed. **Stop** interrupts at any point and returns to the scan pose; if it was holding the cube, take it out and click **Open gripper**. The 3D view shows the robot, the cube and tray models, and the planned paths (purple = joint moves, orange = straight-line moves).
 
 **Tuning in viser**
 - **Grasp height:** lower it if the fingers close above the cube; raise it if they touch the table.

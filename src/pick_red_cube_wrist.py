@@ -9,7 +9,6 @@ the cube from close up to correct it, descends, grasps, lifts and checks the gri
 """
 
 import argparse
-import json
 import math
 import threading
 from pathlib import Path
@@ -19,7 +18,7 @@ import numpy as np
 import trimesh
 from viser.transforms import SO3
 
-from cube_pick_common import CALIB_DIR, Detection, Station, tilted_pose, wrap
+from cube_pick_common import Detection, Station, Stopped, tilted_pose, wrap
 from plate_detection import BlueSettings, PlateDetection, detect_plate, plate_centre
 from wrist_vision import WRIST_CALIB_FILE, WristCalibration, pixel_to_plane
 
@@ -47,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plate-size", type=float, default=0.10, help="Blue plate edge length (m)")
     p.add_argument("--plate-height", type=float, default=0.01, help="Blue plate thickness (m)")
     p.add_argument("--drop-height", type=float, default=0.015, help="Cube bottom above the plate when it is dropped (m)")
+    p.add_argument("--max-place-tilt", type=float, default=50.0,
+                   help="Placing: how far (deg) the gripper may lean from straight down to reach a far tray (grasping stays within 30)")
     p.add_argument(
         "--plate-offset", type=float, nargs=2, default=[0.0, 0.0], metavar=("DX", "DY"),
         help="Constant correction (m) added to the detected plate centre (separate from --target-offset)",
@@ -181,9 +182,11 @@ def main() -> None:
     station = Station(args.port, args.id, cal.camera, cal.detection, viser_port=args.viser_port)
     gui = station.server.gui
     outline = StageOutline(gui, on_end=station.clear_trajectories)
-    pick, put_back, rescan, search, go_high = (threading.Event() for _ in range(5))
+    pick, put_back, rescan, search, go_high, open_req = (threading.Event() for _ in range(6))
     with gui.add_folder("Pick"):
         gui.add_button("Pick & place", color="green").on_click(lambda _: pick.set())
+        gui.add_button("Stop", color="red").on_click(lambda _: station.stop_requested.set())
+        gui.add_button("Open gripper").on_click(lambda _: open_req.set())
         place_box = gui.add_checkbox("Place on blue plate", initial_value=True)
         gui.add_button("Sweep for cube & tray").on_click(lambda _: search.set())
         auto_search = gui.add_checkbox("Sweep on Pick if not visible", initial_value=True)
@@ -195,19 +198,6 @@ def main() -> None:
         # grasp just misses, a too-low one would push the fingers into the table.
         height_mm = gui.add_slider("Grasp height (mm, base frame)", -80, 40, 1, round(args.grasp_z * 1000))
         save_btn = gui.add_button("Save detection settings")
-        reset_corr_btn = gui.add_button("Reset place correction")
-
-    # Learned correction for placing: after each drop, the miss (where the cube landed minus the
-    # tray centre, both seen by the camera) is fed back, so consistent errors shrink over time.
-    corr_file = CALIB_DIR / "place_correction.json"
-    place_corr = np.array(json.loads(corr_file.read_text())["d"] if corr_file.exists() else [0.0, 0.0])
-    print(f"Place correction: ({place_corr[0] * 1000:.0f}, {place_corr[1] * 1000:.0f}) mm")
-
-    @reset_corr_btn.on_click
-    def _(_) -> None:
-        place_corr[:] = 0.0
-        corr_file.write_text(json.dumps({"d": [0.0, 0.0]}))
-        print("Place correction reset to (0, 0)")
 
     blue = BlueSettings.load()
     with gui.add_folder("Blue detection", expand_by_default=False):
@@ -306,16 +296,21 @@ def main() -> None:
             centre, yaw, method = pts.mean(axis=0), math.atan2(edge[1], edge[0]), "fitted quad (fallback)"
         plate_seen["method"] = method
         cx, cy = np.asarray(centre) + np.asarray(plate_offset)
-        return float(cx), float(cy), float(yaw), side
+        return float(cx), float(cy), float(yaw), side, method
 
-    def measure_plate(frames: int = 6) -> tuple[float, float, float, float] | None:
-        """Median plate estimate over several frames at the current arm pose."""
+    def measure_plate(frames: int = 6, full_only: bool = False) -> tuple[float, float, float, float] | None:
+        """Median plate estimate over several frames at the current arm pose. With full_only, a
+        frame counts only if the whole tray is in view (its outline does not touch the image edge)
+        and its centre came from all 4 corners or a full diagonal (at most one corner hidden, e.g.
+        by the gripper) - a partial view would pull the centre towards the visible part."""
         found = []
         for _ in range(frames):
             station.idle(station.dt)
             det, _ = detect_plate(station.frame, blue_settings(), tray_ok) if station.frame is not None else (None, None)
-            loc = locate_plate(det) if det is not None else None
-            if loc is not None:
+            if det is None or (full_only and det.touches_border):
+                continue
+            loc = locate_plate(det)
+            if loc is not None and (not full_only or loc[4] in ("4 corners", "diagonal")):
                 found.append(loc)
         if len(found) < frames // 2:
             return None
@@ -368,12 +363,14 @@ def main() -> None:
 
     station.cube_accept = cube_ok
 
-    def locate(det: Detection) -> tuple[float, float, float] | None:
-        """Object (x, y, edge direction) in the base frame from a detection at the current arm pose."""
+    def locate(det: Detection, top_z: float | None = None) -> tuple[float, float, float] | None:
+        """Object (x, y, edge direction) in the base frame from a detection at the current arm pose,
+        with the cube's top face at top_z (default: cube standing on the table)."""
+        top_z = cube_top_z if top_z is None else top_z
         t_base_cam = station.kin.forward_kinematics(station.q) @ t_gripper_cam
-        centre = pixel_to_plane(det.u, det.v, k, dist, t_base_cam, cube_top_z)
+        centre = pixel_to_plane(det.u, det.v, k, dist, t_base_cam, top_z)
         a = math.radians(det.angle_deg)
-        edge = pixel_to_plane(det.u + 15 * math.cos(a), det.v + 15 * math.sin(a), k, dist, t_base_cam, cube_top_z)
+        edge = pixel_to_plane(det.u + 15 * math.cos(a), det.v + 15 * math.sin(a), k, dist, t_base_cam, top_z)
         if centre is None or edge is None:
             return None
         cube_yaw = math.atan2(edge[1] - centre[1], edge[0] - centre[0])
@@ -385,16 +382,17 @@ def main() -> None:
     if not hover_options:
         hover_options = [cube_top_z + 0.025]
 
-    def plan_topdown(x: float, y: float, square_yaw: float, z: float, hovers: list[float], prefer_yaw: float | None = None) -> dict | None:
-        """First feasible gripper pose at (x, y, z): straight down if possible, else tilted up to
-        30 deg; the jaws aligned with the square's edges (least wrist roll first); the highest
-        hover height that the same orientation can reach."""
+    def plan_topdown(x: float, y: float, square_yaw: float, z: float, hovers: list[float], prefer_yaw: float | None = None,
+                     tilts=(0, 10, -10, 20, -20, 30, -30)) -> dict | None:
+        """First feasible gripper pose at (x, y, z): straight down if possible, else tilted by the
+        smallest of `tilts` that reaches; the jaws aligned with the square's edges (least wrist
+        roll first); the highest hover height that the same orientation can reach."""
         radial = math.atan2(y, x)
         # try first the jaw yaw closest to `prefer_yaw` (the current one, for placing: least wrist
         # turning) or else to the arm's reach direction (least wrist roll)
         ref = radial if prefer_yaw is None else prefer_yaw
         yaws = sorted({round(wrap(square_yaw + k * math.pi / 2), 6) for k in range(4)}, key=lambda a: abs(wrap(a - ref)))
-        for tilt in (0, 10, -10, 20, -20, 30, -30):
+        for tilt in tilts:
             for yaw in yaws:
                 if station.solve_pose(tilted_pose(x, y, z, yaw, tilt), yaw) is None:
                     continue
@@ -407,6 +405,8 @@ def main() -> None:
     def plan_grasp(x: float, y: float, cube_yaw: float) -> dict | None:
         return plan_topdown(x, y, cube_yaw, height_mm.value / 1000, hover_options)
 
+    PLACE_TILTS = sorted({t for a in range(0, int(args.max_place_tilt) + 1, 5) for t in (a, -a)}, key=lambda t: (abs(t), t > 0))
+
     def plan_place(x: float, y: float, plate_yaw: float, prefer_yaw: float | None = None) -> dict | None:
         """Drop pose over the plate centre: the held cube's bottom `drop_height` above the plate,
         its edges aligned with the plate's; the approach (hover) pose is directly above it, at
@@ -416,7 +416,34 @@ def main() -> None:
         z = plate_top_z + args.drop_height + grip_above_bottom
         min_hover = z + 0.02
         hovers = [h for h in (0.10, 0.09, 0.08, 0.07, 0.06, 0.05, 0.04) if h >= min_hover] or [min_hover]
-        return plan_topdown(x, y, plate_yaw, z, hovers, prefer_yaw)
+        # A dropped cube does not need a top-down gripper: reaching the tray matters more. Lean
+        # angles are tried smallest first in 5 deg steps up to --max-place-tilt (leaning outward
+        # reaches further), so a near tray is still placed straight down.
+        return plan_topdown(x, y, plate_yaw, z, hovers, prefer_yaw, PLACE_TILTS) or plan_position_first(x, y, z, prefer_yaw)
+
+    def plan_position_first(x: float, y: float, z: float, prefer_yaw: float | None = None) -> dict | None:
+        """Drop pose when no lean angle reaches: the TCP exactly at (x, y, z), orientation whatever
+        the arm ends up with (seeded from straight down and from leaning 20/40/60 deg outward).
+        The approach pose is 2-5 cm straight above, reached the same way."""
+        yaw = math.atan2(y, x) if prefer_yaw is None else prefer_yaw
+        seeds = []
+        for tilt in (0, -20, -40, -60):
+            target = tilted_pose(x, y, z, yaw, tilt)
+            q = station._seed(target, yaw)
+            for _ in range(20):
+                q = station.kin.inverse_kinematics(q, target @ station.t_tcp_flange, orientation_weight=0.1)
+            seeds.append(q)
+        q_drop = station.solve_position(np.array([x, y, z]), seeds)
+        if q_drop is None:
+            return None
+        reached = station.tcp_pose(q_drop)
+        lean = math.degrees(math.acos(np.clip(-reached[2, 2], -1.0, 1.0)))
+        for dz in (0.05, 0.04, 0.03, 0.02):
+            q_hover = station.solve_position(np.array([x, y, z + dz]), [q_drop])
+            if q_hover is not None:
+                return {"x": x, "y": y, "yaw": yaw, "tilt": -lean, "hover_z": z + dz, "grasp_z": z,
+                        "q_hover": q_hover, "rot": reached[:3, :3]}
+        return None
 
     def plan_carry(pick_plan: dict, place_plan: dict) -> float | None:
         """Highest carry height at which the gripper can travel in a straight, level line from
@@ -442,10 +469,17 @@ def main() -> None:
         return None
 
     def describe(plan: dict) -> str:
-        how = "straight down" if plan["tilt"] == 0 else f"tilted {abs(plan['tilt'])} deg {'inward' if plan['tilt'] > 0 else 'outward'}"
+        if plan.get("rot") is not None:
+            how = f"position first, leaning {abs(plan['tilt']):.0f} deg"
+        else:
+            how = "straight down" if plan["tilt"] == 0 else f"tilted {abs(plan['tilt'])} deg {'inward' if plan['tilt'] > 0 else 'outward'}"
         return f"{how}, jaw yaw {math.degrees(plan['yaw']):.0f} deg, hover {plan['hover_z'] * 1000:.0f} mm"
 
     def pose(plan: dict, z: float) -> np.ndarray:
+        if plan.get("rot") is not None:  # position-first plan: keeps the orientation IK found
+            t = np.eye(4)
+            t[:3, :3], t[:3, 3] = plan["rot"], (plan["x"], plan["y"], z)
+            return t
         return tilted_pose(plan["x"], plan["y"], z, plan["yaw"], plan["tilt"])
 
     cache = {"uv": None, "plan": None}
@@ -558,229 +592,284 @@ def main() -> None:
         cache["uv"] = None
         return True
 
+    def retreat() -> None:
+        """Back to the scan pose from wherever the arm was stopped: first straight up if the
+        gripper is low (so it does not drag across the table, the cube or the tray)."""
+        here = station.tcp_pose(station.q_cmd)
+        if here[2, 3] < table_z + 0.08:
+            up = here.copy()
+            up[2, 3] = table_z + 0.08
+            station.cart_move(up, args.speed)
+        go_scan()
+
     station.connect()
     try:
         station.set_gripper(args.gripper_open)
         go_scan()
         while True:
-            event = station.wait_for(pick, rescan, search, go_high, on_tick=preview)
-            if event is rescan:
-                go_scan()
-                continue
-            if event is go_high:  # stays there; Pick & place looks from here, Back to scan pose returns
-                q = high_q.copy()
-                q[5] = station.q_cmd[5]
-                station.joint_move(q, speed_deg_s=30)
-                cache["uv"] = None
-                continue
-            if event is search:
-                cube_found, tray_found = sweep(True, place_box.value)
-                go_scan()
-                station.set_status("Sweep: " + "; ".join(
-                    f"{name} {'at (%.3f, %.3f) m' % f[:2] if f else 'not found'}"
-                    for name, f in (("cube", cube_found), ("tray", tray_found)) if name == "cube" or place_box.value))
-                continue
-            station.clear_trajectories()  # draw this pick-and-place's moves on a clean slate
-            outline.begin(PLACE_STAGES if place_box.value else HOLD_STAGES)
-            plate, where = None, None
-            if place_box.value:  # find the plate first, so we never pick up a cube we cannot place
-                outline.step("Find tray")
-                plate = measure_plate()
-            det = station.average_detection()
-            where = locate(det) if det is not None else None
-            need_tray, need_cube = place_box.value and plate is None, where is None
-            if (need_tray or need_cube) and auto_search.value:
-                cube_found, tray_found = sweep(True, place_box.value)  # always both: stops only once both are seen
-                if need_tray and tray_found is not None:
-                    plate = (measure_plate() if look_at(*tray_found[:2]) else None) or tray_found
-                if need_cube and cube_found is not None:
-                    det = station.average_detection() if look_at(*cube_found[:2]) else None
-                    where = (locate(det) if det is not None else None) or cube_found
-                if where is None or not need_cube:
-                    go_scan()
-            if place_box.value:
-                if plate is None:
-                    station.set_status(f"**No blue tray found** (looking for a {args.plate_size * 100:.0f} cm square). "
-                                       "Put it in reach (or tune *Blue detection*), or untick *Place on blue plate*.")
-                    outline.fail("no blue tray found")
-                    continue
-                if plan_place(plate[0], plate[1], plate[2]) is None:
-                    station.set_status(f"**Tray out of reach** at {np.hypot(plate[0], plate[1]) * 100:.0f} cm from the base "
-                                       "- move it to 10-28 cm.")
-                    outline.fail("tray out of reach")
-                    continue
-                outline.note("Find tray", f"({plate[0]:.3f}, {plate[1]:.3f}) m")
-            outline.step("Find cube")
-            if where is None:
-                station.set_status(f"**No red cube found** (looking for a {args.cube_size * 1000:.0f} mm cube) from the scan pose"
-                                   f"{' or in any of the ' + str(len(sweep_poses)) + ' sweep views' if auto_search.value else ''}. "
-                                   "Put it in reach (or tune *Red detection*).")
-                outline.fail("no red cube found")
-                continue
-            plan = plan_grasp(*where)
-            if plan is None:
-                station.set_status(f"**Cube out of reach** at {np.hypot(where[0], where[1]) * 100:.0f} cm from the base "
-                                   "(no grasp even tilted 30 deg) - move it to 10-28 cm.")
-                outline.fail("cube out of reach")
-                continue
-            outline.note("Find cube", f"({plan['x']:.3f}, {plan['y']:.3f}) m")
-            outline.step("Move above cube")
-            station.set_status(f"Scan estimate ({plan['x']:.3f}, {plan['y']:.3f}), {describe(plan)}. Moving above it...")
-            q_hover = plan["q_hover"].copy()
-            q_hover[5] = args.gripper_open
-            station.joint_move(q_hover)
-
-            # Close-up re-detection (twice): errors from the high scan pose shrink with distance.
-            outline.step("Close-up check of cube")
-            for _ in range(2):
-                station.idle(0.4)
-                det = station.average_detection()
-                refined = locate(det) if det is not None else None
-                if refined is None:
-                    print("Object not visible from the hover pose (the camera may not see under the gripper); "
-                          "using the scan estimate.")
-                    break
-                new_plan = plan_grasp(*refined) if np.hypot(refined[0] - plan["x"], refined[1] - plan["y"]) < 0.06 else None
-                if new_plan is None:
-                    print(f"Close-up estimate ({refined[0]:.3f}, {refined[1]:.3f}) unusable; keeping ({plan['x']:.3f}, {plan['y']:.3f}).")
-                    break
-                print(f"Refined ({plan['x']:.3f}, {plan['y']:.3f}) -> ({new_plan['x']:.3f}, {new_plan['y']:.3f})")
-                plan = new_plan
-                station.cart_move(pose(plan, plan["hover_z"]), args.speed)
-
-            x, y, grasp_z = plan["x"], plan["y"], plan["grasp_z"]
-            outline.note("Close-up check of cube", f"({x:.3f}, {y:.3f}) m")
-            outline.step("Descend & grasp", describe(plan))
-            station.show_target(np.array([x, y, cube_top_z]))
-            station.set_status(f"Grasping at ({x:.3f}, {y:.3f}), gripper height {grasp_z * 1000:.0f} mm, {describe(plan)}...")
-            station.cart_move(pose(plan, grasp_z), args.speed)
-            station.set_gripper(args.gripper_closed, 0.8)
-            # The jaws stop on the cube; commanding "fully closed" would sit >5 units beyond where the
-            # gripper is, and the safety limiter would clamp it to "5 tighter than now" every step.
-            # Command that squeeze directly: same grip force, no constant clamping.
-            hold = station.q_cmd.copy()
-            hold[5] = max(args.gripper_closed, station.q[5] - 4.5) if args.gripper_closed < args.gripper_open \
-                else min(args.gripper_closed, station.q[5] + 4.5)
-            station.send(hold)
-            cube_state["held"] = True
-            outline.step("Lift")
-            station.cart_move(pose(plan, plan["hover_z"]), args.speed)
-            station.idle(0.3)
-
-            reading = station.q[5]
-            if abs(reading - args.gripper_closed) < 5.0:
-                station.set_status(
-                    f"**Missed** (gripper closed fully: {reading:.0f}) at height {grasp_z * 1000:.0f} mm. If the fingers "
-                    "closed above the cube, lower *Grasp height* ~10 mm and Pick again. Returning to scan pose."
-                )
-                cube_state["held"] = False
-                show_cube(plan["x"], plan["y"], plan["yaw"], table_z)  # still where it was
-                station.set_gripper(args.gripper_open)
-                go_scan()
-                outline.fail("missed the cube (gripper closed on nothing)")
-                continue
-            if plate is not None:
-                place = plan_place(plate[0], plate[1], plate[2])
-                if place is None:
-                    station.set_status("**Holding the cube, but the plate is out of reach.** Click **Put back**.")
-                else:
-                    # 1) lift straight up, 2) straight level line to above the tray, 3) re-measure the tray
-                    # close up and move over its centre, 4) straight down, 5) drop, 6) back to the scan
-                    # pose, 7) check where the cube landed and learn from the miss
-                    def place_at(tray):
-                        # keep the cube's current orientation as far as possible (it repeats every 90 deg)
-                        return plan_place(tray[0] + place_corr[0], tray[1] + place_corr[1], tray[2], prefer_yaw=plan["yaw"])
-
-                    place = place_at(plate) or place
-                    outline.step("Carry to tray")
-                    carry_z = plan_carry(plan, place)
-                    if carry_z is not None:
-                        station.set_status(f"Lifting to {carry_z * 1000:.0f} mm, then moving above the tray "
-                                           f"({place['x']:.3f}, {place['y']:.3f})...")
-                        station.cart_move(pose(plan, carry_z), args.speed)
-                        station.cart_move(pose(place, carry_z), args.speed)
-                    else:
-                        print("No straight level path to the tray is reachable pointing down; using a joint move instead.")
-                        q_place_hover = place["q_hover"].copy()
-                        q_place_hover[5] = station.q_cmd[5]  # keep the gripper closed on the cube
-                        station.joint_move(q_place_hover)
-                    above_z = carry_z or place["hover_z"]
-
-                    outline.step("Close-up check of tray")
-                    for _ in range(2):  # close-up look at the tray: errors from the far scan view shrink
-                        station.idle(0.4)
-                        close = measure_plate()
-                        if close is None or not (0.7 <= close[3] / args.plate_size <= 1.3) \
-                                or np.hypot(close[0] - plate[0], close[1] - plate[1]) > 0.05:
-                            print("Tray close-up not usable (not fully visible from here); keeping the previous estimate.")
-                            break
-                        new_place = place_at(close)
-                        if new_place is None:
-                            break
-                        print(f"Tray close-up: centre ({plate[0]:.3f}, {plate[1]:.3f}) -> ({close[0]:.3f}, {close[1]:.3f})")
-                        plate, place = close, new_place
-                        station.cart_move(pose(place, above_z), args.speed)
-
-                    outline.note("Close-up check of tray", f"({plate[0]:.3f}, {plate[1]:.3f}) m")
-                    outline.step("Lower & drop")
-                    station.idle(0.3)
-                    station.set_status(f"Lowering to {args.drop_height * 100:.1f} cm above the tray and dropping...")
-                    drop_pose = pose(place, place["grasp_z"])
-                    station.cart_move(drop_pose, args.speed / 2)
-                    reached = station.tcp_pose(station.q)[:3, 3]  # for information only: no corrections (they oscillate)
-                    print(f"Drop: target ({place['x']:.3f}, {place['y']:.3f}), reached ({reached[0]:.3f}, {reached[1]:.3f})")
-                    station.set_gripper(args.gripper_open, 0.3)
+            try:
+                event = station.wait_for(pick, rescan, search, go_high, open_req, on_tick=preview)
+                if event is open_req:
+                    station.set_gripper(args.gripper_open)
                     cube_state["held"] = False
-                    show_cube(reached[0], reached[1], place["yaw"], plate_top_z)  # now on the tray
-                    station.cart_move(pose(place, above_z), args.speed)
-                    outline.step("Return to scan pose")
-                    go_scan()
-
-                    # Where did it land? Tray and cube seen from the same (scan) view.
-                    tray_now = measure_plate() or plate
-                    det = station.average_detection()
-                    landed = locate(det) if det is not None else None
-                    outline.step("Check landing")
-                    if landed is None:
-                        station.set_status("**Dropped** on the tray (could not see the cube afterwards to check).")
-                        outline.finish("dropped on the tray (could not see the cube afterwards)")
-                        continue
-                    miss = np.array([landed[0] - tray_now[0], landed[1] - tray_now[1]])
-                    c_, s_ = math.cos(tray_now[2]), math.sin(tray_now[2])
-                    in_tray = np.array([c_ * miss[0] + s_ * miss[1], -s_ * miss[0] + c_ * miss[1]])  # tray axes
-                    inside = bool(np.all(np.abs(in_tray) < args.plate_size / 2 - args.cube_size / 2))
-                    show_cube(landed[0], landed[1], landed[2], plate_top_z if inside else table_z)
-                    if np.linalg.norm(miss) < 0.06:  # learn from plausible misses only
-                        place_corr[:] = place_corr - 0.7 * miss
-                        if np.linalg.norm(place_corr) > 0.04:
-                            place_corr[:] = place_corr * 0.04 / np.linalg.norm(place_corr)
-                        corr_file.write_text(json.dumps({"d": place_corr.tolist()}))
-                    print(f"Landed {np.linalg.norm(miss) * 1000:.0f} mm from the tray centre ({'inside' if inside else 'OUTSIDE'}); "
-                          f"place correction now ({place_corr[0] * 1000:.0f}, {place_corr[1] * 1000:.0f}) mm")
-                    outline.finish(f"landed {np.linalg.norm(miss) * 1000:.0f} mm from the tray centre, "
-                                   f"{'inside' if inside else 'OUTSIDE'} the tray")
-                    station.set_status(
-                        f"**Placed**: the cube landed {np.linalg.norm(miss) * 1000:.0f} mm from the tray centre, "
-                        f"**{'inside' if inside else 'OUTSIDE'}** the tray. Next drop is corrected by "
-                        f"({place_corr[0] * 1000:.0f}, {place_corr[1] * 1000:.0f}) mm."
-                    )
                     continue
-            if place_box.value:
-                outline.fail("holding the cube, but the tray is out of reach - click Put back")
-            else:
-                outline.step("Holding (Put back)")
-            station.set_status(f"**Holding the cube** (gripper reading {reading:.0f}). Click **Put back** to set it down.")
-            put_back_btn.disabled = False
-            station.wait_for(put_back)
-            put_back_btn.disabled = True
-            station.cart_move(pose(plan, grasp_z + 0.003), args.speed)
-            station.set_gripper(args.gripper_open)
-            cube_state["held"] = False
-            show_cube(plan["x"], plan["y"], plan["yaw"], table_z)
-            station.cart_move(pose(plan, plan["hover_z"]), args.speed)
-            go_scan()
-            if not place_box.value:
-                outline.finish("put back")
+                if event is rescan:
+                    go_scan()
+                    continue
+                if event is go_high:  # stays there; Pick & place looks from here, Back to scan pose returns
+                    q = high_q.copy()
+                    q[5] = station.q_cmd[5]
+                    station.joint_move(q, speed_deg_s=30)
+                    cache["uv"] = None
+                    continue
+                if event is search:
+                    cube_found, tray_found = sweep(True, place_box.value)
+                    go_scan()
+                    station.set_status("Sweep: " + "; ".join(
+                        f"{name} {'at (%.3f, %.3f) m' % f[:2] if f else 'not found'}"
+                        for name, f in (("cube", cube_found), ("tray", tray_found)) if name == "cube" or place_box.value))
+                    continue
+                station.clear_trajectories()  # draw this pick-and-place's moves on a clean slate
+                outline.begin(PLACE_STAGES if place_box.value else HOLD_STAGES)
+                plate, where = None, None
+                if place_box.value:  # find the plate first, so we never pick up a cube we cannot place
+                    outline.step("Find tray")
+                    plate = measure_plate()
+                det = station.average_detection()
+                where = locate(det) if det is not None else None
+                need_tray, need_cube = place_box.value and plate is None, where is None
+                if (need_tray or need_cube) and auto_search.value:
+                    cube_found, tray_found = sweep(True, place_box.value)  # always both: stops only once both are seen
+                    if need_tray and tray_found is not None:
+                        plate = (measure_plate() if look_at(*tray_found[:2]) else None) or tray_found
+                    if need_cube and cube_found is not None:
+                        det = station.average_detection() if look_at(*cube_found[:2]) else None
+                        where = (locate(det) if det is not None else None) or cube_found
+                    if where is None or not need_cube:
+                        go_scan()
+                if place_box.value:
+                    if plate is None:
+                        station.set_status(f"**No blue tray found** (looking for a {args.plate_size * 100:.0f} cm square). "
+                                           "Put it in reach (or tune *Blue detection*), or untick *Place on blue plate*.")
+                        outline.fail("no blue tray found")
+                        continue
+                    if plan_place(plate[0], plate[1], plate[2]) is None:
+                        station.set_status(f"**Tray out of reach** at {np.hypot(plate[0], plate[1]) * 100:.0f} cm from the base "
+                                           "- move it to 10-28 cm.")
+                        outline.fail("tray out of reach")
+                        continue
+                    outline.note("Find tray", f"({plate[0]:.3f}, {plate[1]:.3f}) m")
+                outline.step("Find cube")
+                if where is None:
+                    station.set_status(f"**No red cube found** (looking for a {args.cube_size * 1000:.0f} mm cube) from the scan pose"
+                                       f"{' or in any of the ' + str(len(sweep_poses)) + ' sweep views' if auto_search.value else ''}. "
+                                       "Put it in reach (or tune *Red detection*).")
+                    outline.fail("no red cube found")
+                    continue
+                plan = plan_grasp(*where)
+                if plan is None:
+                    station.set_status(f"**Cube out of reach** at {np.hypot(where[0], where[1]) * 100:.0f} cm from the base "
+                                       "(no grasp even tilted 30 deg) - move it to 10-28 cm.")
+                    outline.fail("cube out of reach")
+                    continue
+                outline.note("Find cube", f"({plan['x']:.3f}, {plan['y']:.3f}) m")
+                outline.step("Move above cube")
+                station.set_status(f"Scan estimate ({plan['x']:.3f}, {plan['y']:.3f}), {describe(plan)}. Moving above it...")
+                q_hover = plan["q_hover"].copy()
+                q_hover[5] = args.gripper_open
+                station.joint_move(q_hover)
+
+                # Close-up re-detection (twice): errors from the high scan pose shrink with distance.
+                outline.step("Close-up check of cube")
+                for _ in range(2):
+                    station.idle(0.4)
+                    det = station.average_detection()
+                    refined = locate(det) if det is not None else None
+                    if refined is None:
+                        print("Object not visible from the hover pose (the camera may not see under the gripper); "
+                              "using the scan estimate.")
+                        break
+                    new_plan = plan_grasp(*refined) if np.hypot(refined[0] - plan["x"], refined[1] - plan["y"]) < 0.06 else None
+                    if new_plan is None:
+                        print(f"Close-up estimate ({refined[0]:.3f}, {refined[1]:.3f}) unusable; keeping ({plan['x']:.3f}, {plan['y']:.3f}).")
+                        break
+                    print(f"Refined ({plan['x']:.3f}, {plan['y']:.3f}) -> ({new_plan['x']:.3f}, {new_plan['y']:.3f})")
+                    plan = new_plan
+                    station.cart_move(pose(plan, plan["hover_z"]), args.speed)
+
+                x, y, grasp_z = plan["x"], plan["y"], plan["grasp_z"]
+                outline.note("Close-up check of cube", f"({x:.3f}, {y:.3f}) m")
+                outline.step("Descend & grasp", describe(plan))
+                station.show_target(np.array([x, y, cube_top_z]))
+                station.set_status(f"Grasping at ({x:.3f}, {y:.3f}), gripper height {grasp_z * 1000:.0f} mm, {describe(plan)}...")
+                station.cart_move(pose(plan, grasp_z), args.speed)
+                station.set_gripper(args.gripper_closed, 0.8)
+                # The jaws stop on the cube; commanding "fully closed" would sit >5 units beyond where the
+                # gripper is, and the safety limiter would clamp it to "5 tighter than now" every step.
+                # Command that squeeze directly: same grip force, no constant clamping.
+                hold = station.q_cmd.copy()
+                hold[5] = max(args.gripper_closed, station.q[5] - 4.5) if args.gripper_closed < args.gripper_open \
+                    else min(args.gripper_closed, station.q[5] + 4.5)
+                station.send(hold)
+                cube_state["held"] = True
+                outline.step("Lift")
+                station.cart_move(pose(plan, plan["hover_z"]), args.speed)
+                station.idle(0.3)
+
+                reading = station.q[5]
+                if abs(reading - args.gripper_closed) < 5.0:
+                    station.set_status(
+                        f"**Missed** (gripper closed fully: {reading:.0f}) at height {grasp_z * 1000:.0f} mm. If the fingers "
+                        "closed above the cube, lower *Grasp height* ~10 mm and Pick again. Returning to scan pose."
+                    )
+                    cube_state["held"] = False
+                    show_cube(plan["x"], plan["y"], plan["yaw"], table_z)  # still where it was
+                    station.set_gripper(args.gripper_open)
+                    go_scan()
+                    outline.fail("missed the cube (gripper closed on nothing)")
+                    continue
+                if plate is not None:
+                    place = plan_place(plate[0], plate[1], plate[2])
+                    if place is None:
+                        station.set_status("**Holding the cube, but the plate is out of reach.** Click **Put back**.")
+                    else:
+                        # 1) lift straight up, 2) straight level line to above the tray, 3) re-measure the tray
+                        # close up and move over its centre, 4) straight down, 5) drop, 6) back to the scan
+                        # pose, 7) report where the cube landed
+                        def place_at(tray):
+                            # keep the cube's current orientation as far as possible (it repeats every 90 deg)
+                            return plan_place(tray[0], tray[1], tray[2], prefer_yaw=plan["yaw"])
+
+                        place = place_at(plate) or place
+                        outline.step("Carry to tray")
+                        carry_z = plan_carry(plan, place)
+                        if carry_z is not None:
+                            station.set_status(f"Lifting to {carry_z * 1000:.0f} mm, then moving above the tray "
+                                               f"({place['x']:.3f}, {place['y']:.3f})...")
+                            station.cart_move(pose(plan, carry_z), args.speed)
+                            station.cart_move(pose(place, carry_z), args.speed)
+                        else:
+                            print("No straight level path to the tray is reachable pointing down; using a joint move instead.")
+                            q_place_hover = place["q_hover"].copy()
+                            q_place_hover[5] = station.q_cmd[5]  # keep the gripper closed on the cube
+                            station.joint_move(q_place_hover)
+                        above_z = carry_z or place["hover_z"]
+
+                        # Above the tray the camera is close and usually sees all of it: re-measure, and if
+                        # the whole tray is in view, that measurement replaces the earlier (farther, often
+                        # partial) estimate. Repeat after moving, until the centre stops moving.
+                        outline.step("Close-up check of tray")
+                        updated = False
+                        for _ in range(3):
+                            station.idle(0.4)
+                            close = measure_plate(frames=8, full_only=True)
+                            if close is None:
+                                print("Tray not fully visible from above it; keeping the "
+                                      f"{'updated' if updated else 'scan'} estimate ({plate[0]:.3f}, {plate[1]:.3f}).")
+                                break
+                            shift = float(np.hypot(close[0] - plate[0], close[1] - plate[1]))
+                            if not (0.8 <= close[3] / args.plate_size <= 1.2) or shift > 0.08:
+                                print(f"Full view of the tray looks wrong (edge {close[3] * 100:.1f} cm, shift {shift * 1000:.0f} mm); "
+                                      "keeping the previous estimate.")
+                                break
+                            new_place = place_at(close)
+                            if new_place is None:
+                                print("Updated tray centre is out of reach; keeping the previous estimate.")
+                                break
+                            print(f"Tray centre updated from a full view: ({plate[0]:.3f}, {plate[1]:.3f}) -> "
+                                  f"({close[0]:.3f}, {close[1]:.3f}), shift {shift * 1000:.0f} mm")
+                            plate, place, updated = close, new_place, True
+                            if shift < 0.003:
+                                break  # already above the centre
+                            station.cart_move(pose(place, above_z), args.speed)
+
+                        outline.note("Close-up check of tray", f"({plate[0]:.3f}, {plate[1]:.3f}) m - "
+                                     + ("updated from a full view" if updated else "scan estimate (tray not fully visible above it)"))
+                        outline.step("Lower & drop")
+                        station.idle(0.3)
+                        station.set_status(f"Lowering to {args.drop_height * 100:.1f} cm above the tray and dropping ({describe(place)})...")
+                        drop_pose = pose(place, place["grasp_z"])
+                        station.cart_move(drop_pose, args.speed / 2)
+                        # The descent weights orientation softly, which can cost a few mm of position.
+                        # Position is what matters here: put the TCP exactly on the drop point (from the
+                        # arm model, no camera, so this is a single correction and cannot oscillate).
+                        target_xyz = drop_pose[:3, 3]
+                        off = float(np.linalg.norm(station.tcp_pose(station.q_cmd)[:3, 3] - target_xyz))
+                        if off > 0.002:
+                            q_fix = station.solve_position(target_xyz, [station.q_cmd])
+                            if q_fix is not None:
+                                print(f"Drop point corrected by {off * 1000:.1f} mm (position first, orientation free)")
+                                station.joint_move(q_fix, speed_deg_s=10)
+                        reached = station.tcp_pose(station.q)[:3, 3]  # measured: includes motor sag
+                        print(f"Drop: target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, {target_xyz[2]:.3f}), "
+                              f"reached ({reached[0]:.3f}, {reached[1]:.3f}, {reached[2]:.3f}) - "
+                              f"{np.linalg.norm(reached - target_xyz) * 1000:.0f} mm off")
+                        station.set_gripper(args.gripper_open, 0.3)
+                        cube_state["held"] = False
+                        show_cube(reached[0], reached[1], place["yaw"], plate_top_z)  # now on the tray
+                        station.cart_move(pose(place, above_z), args.speed)
+                        outline.step("Return to scan pose")
+                        go_scan()
+
+                        # Where did it land? Tray and cube seen from the same (scan) view.
+                        tray_now = measure_plate() or plate
+                        det = station.average_detection()
+                        # a cube in the tray stands on its floor, so its top face is plate-height higher
+                        landed = locate(det, plate_top_z + args.cube_size) if det is not None else None
+                        outline.step("Check landing")
+                        if landed is None:
+                            station.set_status("**Dropped** on the tray (could not see the cube afterwards to check).")
+                            outline.finish("dropped on the tray (could not see the cube afterwards)")
+                            continue
+                        miss = np.array([landed[0] - tray_now[0], landed[1] - tray_now[1]])
+                        c_, s_ = math.cos(tray_now[2]), math.sin(tray_now[2])
+                        in_tray = np.array([c_ * miss[0] + s_ * miss[1], -s_ * miss[0] + c_ * miss[1]])  # tray axes
+                        inside = bool(np.all(np.abs(in_tray) < args.plate_size / 2 - args.cube_size / 2))
+                        if not inside:  # on the table after all: locate it on the table plane instead
+                            landed = locate(det) or landed
+                            miss = np.array([landed[0] - tray_now[0], landed[1] - tray_now[1]])
+                        show_cube(landed[0], landed[1], landed[2], plate_top_z if inside else table_z)
+                        print(f"Landed {np.linalg.norm(miss) * 1000:.0f} mm from the tray centre ({'inside' if inside else 'OUTSIDE'}), "
+                              f"offset ({miss[0] * 1000:.0f}, {miss[1] * 1000:.0f}) mm")
+                        outline.finish(f"landed {np.linalg.norm(miss) * 1000:.0f} mm from the tray centre, "
+                                       f"{'inside' if inside else 'OUTSIDE'} the tray")
+                        station.set_status(
+                            f"**Placed**: the cube landed {np.linalg.norm(miss) * 1000:.0f} mm from the tray centre, "
+                            f"**{'inside' if inside else 'OUTSIDE'}** the tray."
+                        )
+                        continue
+                if place_box.value:
+                    outline.fail("holding the cube, but the tray is out of reach - click Put back")
+                else:
+                    outline.step("Holding (Put back)")
+                station.set_status(f"**Holding the cube** (gripper reading {reading:.0f}). Click **Put back** to set it down.")
+                put_back_btn.disabled = False
+                station.wait_for(put_back)
+                put_back_btn.disabled = True
+                station.cart_move(pose(plan, grasp_z + 0.003), args.speed)
+                station.set_gripper(args.gripper_open)
+                cube_state["held"] = False
+                show_cube(plan["x"], plan["y"], plan["yaw"], table_z)
+                station.cart_move(pose(plan, plan["hover_z"]), args.speed)
+                go_scan()
+                if not place_box.value:
+                    outline.finish("put back")
+            except Stopped:
+                # Stop button: whatever was running is abandoned; go back to the scan pose. A held
+                # cube stays in the gripper (it is not dropped mid-air) until Open gripper.
+                put_back_btn.disabled = True
+                if outline.stages and 0 <= outline.current < len(outline.stages):  # an attempt was running
+                    outline.fail("stopped by the user")
+                station.set_status("**Stopped.** Returning to the scan pose" + (
+                    " - still holding the cube: take it out and click **Open gripper**." if cube_state["held"] else "."))
+                station.show_target(None)
+                while True:  # another Stop during the return just restarts it
+                    station.stop_requested.clear()
+                    try:
+                        retreat()
+                        break
+                    except Stopped:
+                        continue
     except KeyboardInterrupt:
         print("Stopping.")
     finally:

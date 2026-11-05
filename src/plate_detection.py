@@ -36,6 +36,7 @@ class PlateDetection:
     corners: np.ndarray  # (4, 2) pixel corners of the plate outline
     contour: np.ndarray
     area: float
+    touches_border: bool = False  # outline reaches the image edge: part of the tray is out of view
 
 
 def plate_centre(outline_px: np.ndarray, to_table, size: float, angle_tol_deg: float = 15.0, length_tol: float = 0.15):
@@ -118,4 +119,6 @@ def detect_plate(rgb: np.ndarray, s: BlueSettings, accept=None) -> tuple[PlateDe
     quad = cv2.approxPolyDP(hull, 0.03 * cv2.arcLength(hull, True), True).reshape(-1, 2)
     if len(quad) != 4:
         quad = cv2.boxPoints(cv2.minAreaRect(contour))
-    return PlateDetection(quad.astype(np.float64), contour, area), mask
+    x, y, w, h = cv2.boundingRect(contour)
+    touches = x <= 3 or y <= 3 or x + w >= mask.shape[1] - 3 or y + h >= mask.shape[0] - 3
+    return PlateDetection(quad.astype(np.float64), contour, area, touches), mask

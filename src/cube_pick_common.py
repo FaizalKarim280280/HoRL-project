@@ -167,6 +167,11 @@ def tilted_pose(x: float, y: float, z: float, yaw: float, tilt_deg: float) -> np
 # --- robot + camera + viser -----------------------------------------------------------------
 
 
+class Stopped(Exception):
+    """Raised inside any motion or wait once Station.stop_requested is set (e.g. a Stop button)."""
+
+
+
 class Station:
     """Owns the follower, its camera, the kinematics and the viser page.
 
@@ -189,6 +194,7 @@ class Station:
     ):
         self.detect_red = detect_red
         self.cube_accept = None  # optional callable(contour) -> bool: is this red blob the cube?
+        self.stop_requested = threading.Event()  # set from any thread: the next tick raises Stopped
         self.overlay = None  # optional callable(rgb view) -> rgb view, drawn on the camera image
         index = resolve_camera(camera.index)
         cams = {CAMERA_NAME: OpenCVCameraConfig(index_or_path=index, width=camera.width, height=camera.height, fps=camera.fps)}
@@ -270,6 +276,8 @@ class Station:
     # -- observation + visualization ---------------------------------------------------------
 
     def tick(self) -> None:
+        if self.stop_requested.is_set():
+            raise Stopped()
         obs = self.robot.get_observation()
         self.q = np.array([obs[f"{n}.pos"] for n in ALL_JOINTS], dtype=float)
         frame = obs.get(CAMERA_NAME)
@@ -349,10 +357,7 @@ class Station:
 
     def solve_pose(self, target: np.ndarray, yaw: float, iters: int = 40) -> np.ndarray | None:
         """Joint solution (deg) for a TCP pose (4x4) pointing roughly down, or None if out of reach."""
-        x, y = target[0, 3], target[1, 3]
-        radial = math.atan2(y, x)
-        # Seed: positive pan turns the arm toward -y in this URDF; roll ~ yaw offset from radial.
-        q = np.array([-math.degrees(radial), 0.0, 20.0, 70.0, math.degrees(wrap(yaw - radial)), self.q_cmd[5]])
+        q = self._seed(target, yaw)
         flange_target = target @ self.t_tcp_flange
         for _ in range(iters):
             q = self.kin.inverse_kinematics(q, flange_target, orientation_weight=0.1)
@@ -360,6 +365,26 @@ class Station:
         pos_err = np.linalg.norm(reached[:3, 3] - target[:3, 3])
         rot_err = np.rad2deg(np.linalg.norm(SO3.from_matrix(target[:3, :3].T @ reached[:3, :3]).log()))
         return q if pos_err < 0.005 and rot_err < 5.0 and self.within_limits(q) else None
+
+    def _seed(self, target: np.ndarray, yaw: float) -> np.ndarray:
+        """IK start: positive pan turns the arm toward -y in this URDF; roll ~ yaw offset from radial."""
+        radial = math.atan2(target[1, 3], target[0, 3])
+        return np.array([-math.degrees(radial), 0.0, 20.0, 70.0, math.degrees(wrap(yaw - radial)), self.q_cmd[5]])
+
+    def solve_position(self, xyz: np.ndarray, seeds: list[np.ndarray], iters: int = 40) -> np.ndarray | None:
+        """Position-only IK: the TCP exactly at xyz (within 5 mm), any orientation - whatever the arm
+        ends up with from each seed (it stays close to the seed's). Best seed wins; None if none reaches."""
+        best = None
+        for q in seeds:
+            q = np.array(q, dtype=float)
+            for _ in range(iters):
+                t = self.tcp_pose(q)
+                t[:3, 3] = xyz  # move the TCP (not the flange) to the point; orientation weight 0
+                q = self.kin.inverse_kinematics(q, t @ self.t_tcp_flange, orientation_weight=0.0)
+            err = float(np.linalg.norm(self.tcp_pose(q)[:3, 3] - xyz))
+            if self.within_limits(q) and (best is None or err < best[1]):
+                best = (q, err)
+        return best[0] if best is not None and best[1] < 0.005 else None
 
     def within_limits(self, q: np.ndarray, margin_deg: float = 0.0) -> bool:
         """All arm joints at least margin_deg inside their URDF limits."""

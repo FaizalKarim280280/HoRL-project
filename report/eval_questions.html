@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Evaluation Q&amp;A: SO-101 Wrist-Camera Pick and Place</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});document.body.dataset.ready='1';"></script>
+<style>
+  @page { size: A4; margin: 16mm 17mm 16mm 17mm; }
+  :root { --ink:#1b1f24; --muted:#5b6470; --accent:#1f4e9c; --rule:#d9dee5; --code-bg:#f2f4f7; }
+  body { font-family: "Crimson Pro", Georgia, serif; font-size: 11.6pt; line-height: 1.38; color: var(--ink); background:#fff; margin:0; }
+  h1 { font-size: 21pt; margin: 0 0 2pt; letter-spacing: -0.2pt; }
+  .sub { color: var(--muted); font-size: 11pt; margin-bottom: 10pt; }
+  .toc { columns: 2; column-gap: 18pt; font-size: 10.6pt; margin: 6pt 0 4pt; padding: 8pt 10pt; border: 1px solid var(--rule); border-radius: 4px; }
+  .toc div { break-inside: avoid; margin-bottom: 1.5pt; }
+  .toc b { color: var(--accent); display:inline-block; width: 20pt; }
+  h2.section { font-size: 12.5pt; text-transform: uppercase; letter-spacing: 0.8pt; color: var(--muted); border-bottom: 1px solid var(--rule); padding-bottom: 2pt; margin: 14pt 0 6pt; break-after: avoid; page-break-after: avoid; }
+  .q { break-inside: avoid; margin: 0 0 9pt; }
+  .q h3 { font-size: 12.6pt; margin: 0 0 2pt; color: var(--accent); }
+  .q h3 span { color: var(--ink); font-weight: 700; margin-right: 4pt; }
+  .q p { margin: 2pt 0; }
+  .q ul { margin: 2pt 0 2pt 14pt; padding: 0; }
+  .q li { margin: 1pt 0; }
+  code { font-family: "JetBrains Mono", Menlo, monospace; font-size: 8.4pt; background: var(--code-bg); padding: 0.5pt 3pt; border-radius: 3px; white-space: nowrap; }
+  .katex { font-size: 1.02em; }
+  .katex-display { margin: 4pt 0; }
+  .tip { font-size: 10.6pt; color: var(--muted); border-left: 2px solid var(--rule); padding-left: 6pt; margin-top: 3pt; }
+  table { border-collapse: collapse; width: 100%; font-size: 10.6pt; margin-top: 4pt; }
+  th, td { text-align: left; padding: 3pt 6pt; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .num { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+
+<h1>Evaluation Q&amp;A: SO-101 Wrist-Camera Pick and Place</h1>
+<div class="sub">Pick a red 25&nbsp;mm cube and drop it in a dark-blue 10&times;10&nbsp;cm tray using only the wrist camera (Innomaker, 640&times;480). Answers refer to our code in <code>src/</code> and the values in <code>calibration/</code>.</div>
+
+<div class="toc">
+  <div><b>1</b>System overview</div>
+  <div><b>2</b>Why eye-in-hand only?</div>
+  <div><b>3</b>Camera model &amp; intrinsics</div>
+  <div><b>4</b>Why ChArUco; detection tricks</div>
+  <div><b>5</b>Board pose (PnP)</div>
+  <div><b>6</b>Hand-eye calibration</div>
+  <div><b>7</b>Automatic calibration</div>
+  <div><b>8</b>Pixel &rarr; table position</div>
+  <div><b>9</b>Error sensitivity &amp; accuracy</div>
+  <div><b>10</b>Cube detection &amp; rejecting other objects</div>
+  <div><b>11</b>Tray centre &amp; orientation</div>
+  <div><b>12</b>Grasp planning on a 5-DOF arm</div>
+  <div><b>13</b>Inverse kinematics</div>
+  <div><b>14</b>Trajectory generation</div>
+  <div><b>15</b>TCP, grasp check, gripper force</div>
+  <div><b>16</b>Placing on the tray centre</div>
+  <div><b>17</b>Searching when objects are not visible</div>
+  <div><b>18</b>Failures we hit and how we fixed them</div>
+  <div><b>19</b>Limitations</div>
+  <div><b>20</b>What we would improve</div>
+</div>
+
+<h2 class="section">Overall design</h2>
+
+<div class="q">
+<h3><span>1.</span> Give an overview of how the system works.</h3>
+<p>A single Python loop owns the robot, the camera and a 3D viewer:</p>
+<ul>
+  <li><b>LeRobot provides the hardware and kinematics:</b> <code>SO101Follower.get_observation()</code> returns joint angles and the camera frame, <code>send_action()</code> sends joint targets, and <code>RobotKinematics</code> (placo) gives FK and IK.</li>
+  <li><b>Our pipeline runs in stages:</b> calibrate once (lens model, plus the camera's pose on the gripper) &rarr; from the scan pose, find the tray and the cube (a left-to-right sweep if either is missing) &rarr; plan a reachable grasp &rarr; hover, re-detect close up, descend, grasp, lift &rarr; carry in a straight line above the tray, re-measure it, lower, drop &rarr; check where the cube landed.</li>
+</ul>
+<p>The robot, planned paths, cube and tray are drawn live in <code>viser</code>, and a left panel shows the current stage.</p>
+</div>
+
+<div class="q">
+<h3><span>2.</span> Why use only the wrist camera? What does eye-in-hand cost you?</h3>
+<ul>
+  <li><b>Pros:</b> nothing to mount or calibrate in the room. The camera can move closer to the object, which makes it more accurate. A single hand-eye calibration works for every arm pose.</li>
+  <li><b>Cons:</b> every measurement depends on FK accuracy (motor calibration, URDF) as well as the camera calibration. The view moves, so the object can be out of view, which is why we need a search. The gripper hides part of the image during the final approach. There is only one view, so there's no depth (Q8).</li>
+</ul>
+<div class="tip">The camera's field of view is $2\arctan\!\big(\tfrac{320}{f_x}\big) = 2\arctan\!\big(\tfrac{320}{564}\big) \approx 59^\circ$ horizontally.</div>
+</div>
+
+<h2 class="section">Calibration</h2>
+
+<div class="q">
+<h3><span>3.</span> What camera model do you use and how did you calibrate it?</h3>
+<p><b>The model:</b> a pinhole camera with Brown–Conrady lens distortion. A point $(X,Y,Z)$ in the camera frame gives normalised coordinates $x=X/Z,\;y=Y/Z$. With $r^2=x^2+y^2$:</p>
+$$x_d = x(1+k_1r^2+k_2r^4+k_3r^6) + 2p_1xy + p_2(r^2+2x^2),\qquad u = f_x x_d + c_x$$
+<p>The same holds for $y_d$ and $v$.</p>
+<p><b>The calibration:</b> <code>cv2.calibrateCamera</code> fits these parameters on 30 ChArUco views by minimising the reprojection error. Our result is $f_x{=}564$, $f_y{=}554$, $(c_x,c_y){=}(358,154)$, $k_1{=}{-}0.40$ (strong barrel distortion), RMS 0.83&nbsp;px.</p>
+<ul>
+  <li><b>$k_3$ held at zero</b> (<code>CALIB_FIX_K3</code>). With few views near the image corners, $k_3$ overfits and the model folds back on itself at the edges.</li>
+  <li><b><code>check_distortion</code></b> undistorts the image corners and edge midpoints, then distorts them back. The model is accepted only if the round trip is within 0.5&nbsp;px.</li>
+  <li><b>Fallback:</b> if that check fails, we refit with the principal point fixed at the image centre and no tangential distortion.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>4.</span> Why a ChArUco board, and what did you have to do to detect it reliably?</h3>
+<ul>
+  <li><b>ChArUco combines two patterns.</b> Chessboard corners give sub-pixel accuracy. ArUco markers give every corner a unique ID, so the board works when partly visible or occluded, and its orientation is never ambiguous. Our board is 7&times;5 squares (22&nbsp;mm), markers 15&nbsp;mm, <code>DICT_6X6_250</code>.</li>
+  <li><b>Small markers at 640&times;480</b> are only about 20&nbsp;px wide (about 2.5&nbsp;px per bit), and the default detector decoded only 8 of 17. Fixes:
+    <ul>
+      <li>tuned <code>cv2.aruco.DetectorParameters</code>: <code>perspectiveRemovePixelPerCell=8</code>, a smaller ignored margin, <code>errorCorrectionRate=0.8</code>, sub-pixel corner refinement;</li>
+      <li>detection on an image upscaled 2&times; (<code>cv2.resize</code>, cubic), then mapped back with the pixel-centre correction $u = \frac{u' - (s-1)/2}{s}$.</li>
+    </ul>
+    Detection uses <code>cv2.aruco.CharucoDetector.detectBoard</code>.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>5.</span> How do you get the board's pose in each image?</h3>
+<p><code>matchImagePoints</code> pairs each 3D board corner with its 2D detection. Then <code>cv2.solvePnP</code> with <code>SOLVEPNP_IPPE</code>, a solver made for flat targets, gives an initial pose. <code>cv2.solvePnPRefineLM</code> refines it by Levenberg–Marquardt on</p>
+$$\min_{R,t}\sum_i \big\|\,\pi\big(K,\,d,\;R\,P_i + t\big) - p_i\big\|^2 .$$
+<p>Here $\pi$ is the camera projection, $K$ the intrinsics, $d$ the distortion, $P_i$ the board corners and $p_i$ their detected pixels. Views with an RMS reprojection error above 2&nbsp;px, or fewer than 6 corners, are dropped.</p>
+</div>
+
+<div class="q">
+<h3><span>6.</span> What is hand-eye calibration and how did you solve it?</h3>
+<p>We need $X = T^{\text{gripper}}_{\text{cam}}$, the camera's fixed pose on the gripper. For every sample $i$, FK gives $T^{\text{base}}_{\text{gripper},i}$ and PnP gives $T^{\text{cam}}_{\text{board},i}$. The board doesn't move, so</p>
+$$T^{\text{base}}_{\text{gripper},i}\,X\,T^{\text{cam}}_{\text{board},i} = \text{const}
+\;\Rightarrow\; A_{ij}X = XB_{ij},$$
+$$A_{ij}=(T^{\text{base}}_{\text{gripper},j})^{-1}T^{\text{base}}_{\text{gripper},i},\qquad B_{ij}=T^{\text{cam}}_{\text{board},j}\,(T^{\text{cam}}_{\text{board},i})^{-1}.$$
+<ul>
+  <li><b>Solving:</b> <code>cv2.calibrateHandEye</code> solves this with five methods (Tsai, Park, Horaud, Andreff, Daniilidis). For each, we recompute the board's position in the base frame from every sample and keep the method whose estimates spread least.</li>
+  <li><b>Result:</b> Daniilidis, 30 samples. Board spread 4.9&nbsp;mm RMS, 1.45&deg;. The camera sits 11&nbsp;cm from the gripper frame, its optical axis tilted 31&deg; from the gripper axis.</li>
+  <li><b>Using it:</b> from then on, $T^{\text{base}}_{\text{cam}} = \mathrm{FK}(q)\,X$ for any joint angles $q$.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>7.</span> How did you make the calibration automatic?</h3>
+<p>We set the scan pose by hand (torque off), with every joint at least 15&deg; from its limits. Then the arm collects views by itself.</p>
+<ul>
+  <li><b>Image coverage, by visual servoing.</b> We move the board's centroid $c$ in the image to 9 targets (corners, edges, centre) by commanding pan and wrist flex. The image Jacobian $J = \partial c/\partial(q_{\text{pan}},q_{\text{flex}})$ is measured with small test moves. Each step is $\Delta q = J^{+}(c^*-c)$, limited to 6&deg;. $J$ is refined after every step with Broyden's update:
+  $$J \leftarrow J + \frac{(\Delta c - J\Delta q)\,\Delta q^\top}{\Delta q^\top\Delta q}.$$
+  At each target the wrist also rolls &plusmn;30&deg;.</li>
+  <li><b>Variety:</b> random poses near the scan pose, until there are at least 30 views.</li>
+  <li><b>Safety box:</b> at most &plusmn;35&deg; pan, &plusmn;20&deg; shoulder and elbow, &plusmn;40&deg; wrist flex and &plusmn;60&deg; wrist roll from the scan pose. The gripper stays at least 10&nbsp;cm above the base.</li>
+</ul>
+<p>The same views are then used to solve for the intrinsics and the hand-eye calibration.</p>
+</div>
+
+<h2 class="section">Perception</h2>
+
+<div class="q">
+<h3><span>8.</span> How do you get the cube's 3D position from a single image?</h3>
+<ol style="margin:2pt 0 2pt 14pt;padding:0">
+  <li><b>Pixel centre:</b> the median over 10 frames of the blob's centroid, $u=m_{10}/m_{00}$, $v=m_{01}/m_{00}$ (<code>cv2.moments</code>).</li>
+  <li><b>Undistort:</b> <code>cv2.undistortPoints</code> gives $(x_n,y_n)$, so the ray in the camera frame is $d_c=(x_n,y_n,1)$.</li>
+  <li><b>Into the base frame:</b> $T^{\text{base}}_{\text{cam}}=\mathrm{FK}(q)X=[R\,|\,o]$, so the ray direction is $d = R\,d_c$, starting at $o$.</li>
+  <li><b>Intersect with the cube's top face,</b> $z_{\text{top}} = z_{\text{table}} + 25\text{ mm}$:
+  $$s=\frac{z_{\text{top}}-o_z}{d_z},\qquad p = o + s\,d \quad(s>0).$$</li>
+  <li><b>Constant correction:</b> $(x,y)=(p_x,p_y)+\texttt{TARGET\_OFFSET}$.</li>
+</ol>
+<p>One camera gives a direction but no depth; the known height of the top face supplies the missing distance. The cube's yaw comes from projecting a second pixel 15&nbsp;px along the <code>cv2.minAreaRect</code> edge.</p>
+</div>
+
+<div class="q">
+<h3><span>9.</span> How sensitive is this to errors, and how accurate is it?</h3>
+<ul>
+  <li><b>Wrong plane height:</b> if the assumed height is off by $\Delta z$, the point slides along the ray, giving $\Delta_{xy} \approx \Delta z\,\tan\theta$, where $\theta$ is the ray's angle from vertical. At 45&deg;, 1&nbsp;cm of height error is 1&nbsp;cm of position error. This is why we re-detect from directly above (small $\theta$) before grasping.</li>
+  <li><b>Pixel resolution:</b> at 25&nbsp;cm, 1&nbsp;px is $0.25/564 \approx 0.44$&nbsp;mm. Pixel noise is negligible next to calibration errors.</li>
+  <li><b>Calibration chain:</b> the 4.9&nbsp;mm hand-eye spread includes FK error. Any joint-angle error is amplified by the lever arm, about 0.4&nbsp;mm per 0.1&deg; at 25&nbsp;cm.</li>
+  <li><b>Centroid bias:</b> seen at an angle, the blob includes the cube's side faces, so its centroid isn't the top-face centre (a few mm).</li>
+</ul>
+<div class="tip">An honest observation: hand-eye placed the board 41.6&nbsp;mm below the base, while we use <code>TABLE_Z</code> = &minus;10&nbsp;mm. The fixed part of such errors, together with the centroid bias, is absorbed by <code>TARGET_OFFSET</code> = (&minus;5, 15)&nbsp;mm. The principal point $c_y{=}154$ is also far from the image centre (240), which comes from uneven corner coverage.</div>
+</div>
+
+<div class="q">
+<h3><span>10.</span> How do you detect the cube, and how do you avoid detecting other objects?</h3>
+<ul>
+  <li><b>Colour:</b> threshold in HSV (<code>cv2.cvtColor</code>, <code>cv2.inRange</code>). Red wraps around the hue circle, so we use two ranges, $H\le10$ or $H\ge165$, with $S\ge95$ and $V\ge70$ (our tuned values). Then a morphological open and close (<code>cv2.morphologyEx</code>), and <code>cv2.findContours</code>.</li>
+  <li><b>Size:</b> each candidate's outline is projected onto the plane at the cube's height (the same ray–plane intersection as Q8). This gives its real size in the world, whatever the camera distance. <code>cv2.minAreaRect</code> of the projected points must have its short side $\ge 0.5\,s$ and its long side $\le 3\,s$ ($s=25$&nbsp;mm). The allowance is because, seen at a slant, the side faces make the cube look longer.</li>
+  <li>The largest blob that passes is the cube. It must appear in at least 60% of 10 frames, and the median position is used.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>11.</span> How do you find the tray's centre and orientation, especially when it is partly hidden?</h3>
+<ul>
+  <li><b>Colour:</b> dark blue is $100\le H\le128$, $S\ge140$. The dark table has $S<70$, so saturation is what separates them.</li>
+  <li><b>Outline:</b> <code>cv2.convexHull</code>, then <code>cv2.approxPolyDP</code> ($\varepsilon$ = 2% of the perimeter). The vertices are projected onto the tray's top plane.</li>
+  <li><b>Real corners</b> are vertices whose interior angle $\theta=\arccos\frac{a\cdot b}{|a||b|}$ is within 15&deg; of 90&deg;. A point where the gripper cuts the outline makes some other angle and is ignored. From the corners we keep:
+    <ul>
+      <li>4 corners: centre = their mean;</li>
+      <li>2 opposite corners, $\approx s\sqrt2$ apart: centre = midpoint of the diagonal;</li>
+      <li>2 adjacent corners, $\approx s$ apart: centre = edge midpoint + $\tfrac{s}{2}\hat n$, with $\hat n$ the inward normal.</li>
+    </ul></li>
+  <li><b>Averaging over frames:</b> the median position. The yaw has 90&deg; symmetry, so it is averaged as $\psi=\tfrac14\operatorname{atan2}(\overline{\sin4\psi_i},\overline{\cos4\psi_i})$.</li>
+  <li><b>Size check:</b> a blue blob counts as the tray only if it measures roughly 10&nbsp;cm (loose limits, because the walls make it look larger).</li>
+</ul>
+</div>
+
+<h2 class="section">Planning and control</h2>
+
+<div class="q">
+<h3><span>12.</span> The SO-101 arm has 5 joints. How do you plan a grasp?</h3>
+<ul>
+  <li><b>Why 5 joints is limiting:</b> a full 6-DOF pose isn't reachable in general. Pointing straight down works only because wrist roll then turns the jaws about the vertical axis. Pointing down is often impossible at the edges of the workspace: straight down reaches about 8–32&nbsp;cm from the base at table height, but only 14–24&nbsp;cm at 8&nbsp;cm up.</li>
+  <li><b>The pose:</b> <code>topdown_pose</code> builds the gripper rotation with $z=(0,0,-1)$ (the approach direction) and $x = -(\cos\psi,\sin\psi,0)$ (the jaw closing direction). <code>tilted_pose</code> tilts it about the horizontal axis perpendicular to the reach direction, $\hat a = (-\sin\phi,\cos\phi,0)$ with $\phi = \operatorname{atan2}(y,x)$.</li>
+  <li><b>The search:</b> tilts $0,\pm10,\pm20,\pm30^\circ$ &times; jaw yaws $\psi_{\text{cube}}+k\cdot90^\circ$, sorted by least wrist roll, $|\mathrm{wrap}(\psi-\phi)|$. When placing, they're sorted by closeness to the current yaw instead.</li>
+  <li>The first combination whose grasp pose and hover pose (the highest feasible of 8, 7, 6&hellip; cm) both pass IK wins.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>13.</span> How does your inverse kinematics work?</h3>
+<p><code>RobotKinematics.inverse_kinematics</code> wraps <b>placo</b>, a QP-based differential IK. Each Newton step solves a weighted least-squares problem in $\Delta q$, subject to joint limits:</p>
+$$\min_{\Delta q}\; w_p\|J_p\Delta q - e_p\|^2 + w_o\|J_o\Delta q - e_o\|^2 + \lambda\|\Delta q\|^2 .$$
+<ul>
+  <li><b>Soft orientation:</b> we use $w_o = 0.1$ (position weight 1), so position wins when both can't be met.</li>
+  <li><b>Seeding:</b> <code>solve_pose</code> seeds IK from pan $=-\phi$, a bent elbow and wrist, and roll $=\psi-\phi$. It runs 40 calls of 8 Newton steps each.</li>
+  <li><b>Acceptance:</b> a solution counts only if FK shows it within 5&nbsp;mm and 5&deg; of the target, and inside the URDF joint limits. IK always returns something, so this check is what defines "out of reach".</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>14.</span> How are the trajectories generated?</h3>
+<ul>
+  <li><b>Joint moves</b> (<code>joint_move</code>): all joints follow the same smoothstep $s(\tau)=3\tau^2-2\tau^3$, which has zero velocity at both ends, so they start and stop together. The duration is $T=\max\big(\max_i|\Delta q_i|/30^\circ\!/\text{s},\,0.3\text{ s}\big)$. The gripper's path through space is a curve.</li>
+  <li><b>Straight-line moves</b> (<code>cart_move</code>): the position is interpolated linearly, $p(s)=p_0+s(p_1-p_0)$. The rotation follows the geodesic on SO(3), $R(s) = R_0\exp\!\big(s\log(R_0^\top R_1)\big)$, using <code>viser.transforms.SO3</code>. Speed is 4&nbsp;cm/s and at most 40&deg;/s of rotation. Each 33&nbsp;ms step solves IK starting from the previous step's solution.</li>
+  <li><b>When each is used:</b> joint moves for large repositioning; straight lines for the descent, the lift and the carry, where the path matters.</li>
+  <li><b>Why the speeds:</b> LeRobot's safety limiter (<code>max_relative_target</code> = 5&deg;) clamps each command to within 5&deg; of the measured position. The motors only reach about 42&deg;/s (wrist) and 40 units/s (gripper). Faster commands ran ahead of the arm, got clamped every step, and caused warnings, so we cap our speeds below these limits.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>15.</span> What is your TCP, how do you know the grasp worked, and how do you hold the cube?</h3>
+<ul>
+  <li><b>TCP:</b> <code>gripper_frame_link</code> sits on the inner face of the fixed jaw. The moving jaw pushes the object onto it, so the object's centre ends up half its width away. We therefore use the TCP $T_{\text{tcp}} = \mathrm{FK}(q)\,T(-12.5\text{ mm},0,0)$, and all targets refer to it.</li>
+  <li><b>Grasp check:</b> after lifting, if the gripper reading is within 5 units of "fully closed", the jaws closed on nothing, so it's reported as missed.</li>
+  <li><b>Holding:</b> the jaws stop on the cube. Commanding "fully closed" would leave a large constant error, and the limiter would clamp it every step. Instead we command (current position &minus; 4.5). The position controller's torque grows with that error, so the grip is firm without any clamping.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>16.</span> How does placing work? Is the cube put exactly at the tray centre?</h3>
+<ul>
+  <li><b>Target:</b> the TCP, which is the cube's centre, goes over the estimated tray centre + <code>PLATE_OFFSET</code>. The jaws are turned so the cube's edges line up with the tray's, choosing the 90&deg; option closest to the current jaw angle.</li>
+  <li><b>Carry:</b> it searches for the highest level line on which 12 evenly spaced pointing-down poses from cube to tray are all IK-feasible, lifts to it, and moves along it in a straight line.</li>
+  <li><b>Updating the centre from above:</b> above the tray, the camera is close and usually sees all of it. A frame counts only if the tray doesn't touch the image edge and its centre came from 4 corners or a full diagonal. Such a full view replaces the earlier, farther and often partial estimate, if its edge measures 8–12&nbsp;cm and it moved less than 8&nbsp;cm. The arm slides over the new centre and repeats, up to 3 times, until the shift is under 3&nbsp;mm. Partial views are ignored.</li>
+  <li><b>Drop:</b> the cube's bottom is lowered to 1.5&nbsp;cm above the tray: $z_{\text{TCP}} = z_{\text{tray top}} + 0.015 + (z_{\text{grasp}} - z_{\text{table}})$. Then the gripper opens. The descent is open-loop.</li>
+  <li><b>Check:</b> back at the scan pose, the landed cube is located on the plane of its top face <i>inside the tray</i>, $z = z_{\text{tray top}} + 25$&nbsp;mm. Its offset from the tray centre is reported in the tray's own axes, inside or outside.</li>
+  <li><b>Why there's no learned correction:</b> we tried $c \leftarrow c - 0.7\,e$ across drops. But the landing check located the cube on the <i>table</i> plane, 1&nbsp;cm too low. That made a constant false miss of about $1\text{ cm}\cdot\tan\theta$, which the correction kept integrating, up to 4&nbsp;cm. Feedback is only as good as its measurement, so we removed it.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>17.</span> What happens if an object is not visible or out of reach?</h3>
+<ul>
+  <li><b>High view:</b> the highest camera pose that still looks at the same area as the scan pose (within 4&nbsp;cm), with the camera looking at least 40&deg; below horizontal.</li>
+  <li><b>Sweep:</b> pan offsets from &minus;60&deg; to +60&deg; in 15&deg; steps (9 views), from your left to your right, 0.5&nbsp;s settle at each. It stops early only once both the cube and the tray have been seen. Sightings are clustered: those within 3&nbsp;cm count as the same object, and the most-voted cluster wins.</li>
+  <li><b>Closer look:</b> the arm returns to the scan pose turned towards the object, $\Delta q_{\text{pan}} = -\big(\operatorname{atan2}(y,x) - \phi_{\text{scan}}\big)$, and measures again.</li>
+  <li><b>Out of reach:</b> no plan passes IK, so nothing moves. The message gives the distance and the working range, e.g. "Cube out of reach at 34&nbsp;cm – move it to 10–28&nbsp;cm". The tray is checked before the cube is picked up, so the arm never picks a cube it can't place.</li>
+</ul>
+</div>
+
+<h2 class="section">Failures and insights</h2>
+
+<div class="q">
+<h3><span>18.</span> What went wrong during development, and how did you fix it?</h3>
+<ul>
+  <li><b>Few markers decoded:</b> the board was too small in the image. Fixed with tuned detector parameters and 2&times; upscaling (Q4).</li>
+  <li><b>Lens model broke near the corners:</b> caused by $k_3$ overfitting without corner coverage. Fixed with <code>CALIB_FIX_K3</code>, the round-trip check, and automatic corner coverage.</li>
+  <li><b>Scan pose at a joint limit:</b> the automatic calibration couldn't move around it. Fixed by requiring a 15&deg; margin.</li>
+  <li><b>Wrong camera opened:</b> macOS renumbers cameras. Fixed by choosing the camera by name, reproducing OpenCV's order from <code>system_profiler SPCameraDataType</code> sorted by unique ID.</li>
+  <li><b>Cube dropped short of a partly visible tray:</b> the estimated centre shifted towards the visible part. Fixed by finding the centre from real corners (or a diagonal), and by re-measuring close up.</li>
+  <li><b>Oscillation above the tray:</b> continuous camera correction, with camera latency and FK error, kept chasing itself. Replaced with one close-up measurement, then a straight move.</li>
+  <li><b>A learned place correction drifted</b> because its landing measurement used the wrong plane height (Q16). We removed it.</li>
+  <li><b>Limiter clamp warnings:</b> fixed by commanding speeds the motors can follow (Q14, Q15).</li>
+  <li><b>Random red or blue things detected:</b> fixed with the real-world size checks (Q10, Q11).</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>19.</span> What are the main limitations?</h3>
+<ul>
+  <li><b>Colour thresholds</b> are sensitive to lighting and reflections, and other saturated red or blue objects of a similar size still pass.</li>
+  <li><b>Planar assumption:</b> the cube must sit on the table plane, upright, and be 25&nbsp;mm tall. A stacked or tilted cube is mislocated (Q9).</li>
+  <li><b>No closed loop at contact:</b> the final descent is open-loop, because the gripper blocks the view. Errors from FK and calibration (about 5&nbsp;mm) go straight into the grasp.</li>
+  <li><b>Small workspace:</b> about 10–28&nbsp;cm, and smaller still above the table.</li>
+  <li><b>Constant offsets</b> (<code>TARGET_OFFSET</code>, <code>PLATE_OFFSET</code>) only fix bias that is the same everywhere, not errors that vary across the workspace.</li>
+</ul>
+</div>
+
+<div class="q">
+<h3><span>20.</span> What would you improve with more time?</h3>
+<ul>
+  <li><b>Better calibration:</b> more views reaching the image corners (fixing the off-centre $c_y$), and a joint refinement of hand-eye, table plane and joint offsets using bundle adjustment.</li>
+  <li><b>Closed-loop final approach:</b> image-based visual servoing on the cube while descending, or a second camera that sees under the gripper.</li>
+  <li><b>Learned detection:</b> segmentation or keypoint detection, for robustness to lighting, and the cube's full pose from its visible edges (PnP on a known cube).</li>
+  <li><b>A position-dependent error model</b> learned from many landings, e.g. a correction field over $(x,y)$, instead of one constant.</li>
+  <li><b>Collision-aware planning</b> (tray walls, the table), and a time-optimal trajectory generator instead of fixed speeds.</li>
+</ul>
+</div>
+
+<div style="break-inside: avoid; page-break-inside: avoid;">
+<h2 class="section">Key numbers at a glance</h2>
+<table class="num">
+  <tr><th>Item</th><th>Value</th><th>Where</th></tr>
+  <tr><td>Intrinsics</td><td>$f_x{=}564,\,f_y{=}554,\,c{=}(358,154)$, $k_1{=}{-}0.40$, RMS 0.83&nbsp;px, 30 views</td><td><code>wrist_calibration.json</code></td></tr>
+  <tr><td>Hand-eye</td><td>Daniilidis, 30 samples, board spread 4.9&nbsp;mm / 1.45&deg;</td><td><code>calibrate_wrist_handeye.py</code></td></tr>
+  <tr><td>Camera on gripper</td><td>11&nbsp;cm from the gripper frame, optical axis 31&deg; from the gripper axis</td><td><code>t_gripper_cam</code></td></tr>
+  <tr><td>Control</td><td>30&nbsp;Hz; limiter 5&deg;/step; joints 30&deg;/s; straight lines 4&nbsp;cm/s, &le;40&deg;/s; gripper 40&nbsp;units/s</td><td><code>cube_pick_common.py</code></td></tr>
+  <tr><td>Reach (pointing down)</td><td>8–32&nbsp;cm at table height; 14–24&nbsp;cm at 8&nbsp;cm up</td><td>IK sweep</td></tr>
+  <tr><td>Grasp search</td><td>tilt 0, &plusmn;10, &plusmn;20, &plusmn;30&deg; &times; 4 jaw yaws; IK within 5&nbsp;mm / 5&deg;</td><td><code>plan_topdown</code></td></tr>
+  <tr><td>Placing</td><td>drop 1.5&nbsp;cm above the tray centre; centre updated from full views above the tray</td><td><code>pick_red_cube_wrist.py</code></td></tr>
+  <tr><td>Sweep</td><td>&plusmn;60&deg; in 15&deg; steps (9 views), stops once both objects are seen</td><td><code>sweep</code></td></tr>
+  <tr><td>Size checks</td><td>cube 0.5–3&times; of 25&nbsp;mm; tray &le;1.8&times; and &ge;0.5&times; of 10&nbsp;cm (0.25&times; if cut off)</td><td><code>cube_ok</code>, <code>tray_ok</code></td></tr>
+</table>
+</div>
+
+</body>
+</html>
