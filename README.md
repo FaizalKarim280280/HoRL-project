@@ -10,6 +10,7 @@ An SO-101 arm finds a red cube with its wrist camera, picks it up and drops it i
 | `calibration/` | Camera calibration and colour settings |
 | `assets/` | SO-101 URDF and meshes |
 | `notebooks/` | ChArUco and colour detection on a single image |
+| `A2/` | Learning the same task from demonstrations: recording a wrist + scene camera dataset (then ACT); see [A2/README.md](A2/README.md) |
 
 ## Installation
 

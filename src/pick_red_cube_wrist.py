@@ -220,7 +220,18 @@ def main() -> None:
         print(f"Saved red detection settings to {args.calib} and blue to the calibration folder")
 
     plate_top_z = table_z + args.plate_height
-    plate_offset = args.plate_offset
+    # Constant correction of the tray centre (base frame), live-tunable: the camera->table geometry
+    # has the same kind of error that --target-offset corrects for the cube (largely the hand-eye
+    # table height disagreeing with TABLE_Z), so the tray needs its own correction too.
+    with gui.add_folder("Tray offset"):
+        plate_dx = gui.add_slider("Tray x offset (mm, + = away from base)", -40, 40, 1, round(args.plate_offset[0] * 1000))
+        plate_dy = gui.add_slider("Tray y offset (mm, + = robot's left)", -40, 40, 1, round(args.plate_offset[1] * 1000))
+
+    @plate_dx.on_update
+    @plate_dy.on_update
+    def _(_) -> None:
+        print(f'Tray offset now ({plate_dx.value}, {plate_dy.value}) mm - to keep it, set in common.sh: '
+              f'PLATE_OFFSET="{plate_dx.value / 1000:g} {plate_dy.value / 1000:g}"')
     # 3D models of the tray and the cube, built from their real dimensions and placed where the
     # camera estimates them (the cube follows the gripper while it is held).
     def box_mesh(sx: float, sy: float, sz: float, rgba: tuple) -> trimesh.Trimesh:
@@ -295,7 +306,7 @@ def main() -> None:
             edge = pts[1] - pts[0]
             centre, yaw, method = pts.mean(axis=0), math.atan2(edge[1], edge[0]), "fitted quad (fallback)"
         plate_seen["method"] = method
-        cx, cy = np.asarray(centre) + np.asarray(plate_offset)
+        cx, cy = np.asarray(centre) + np.array([plate_dx.value, plate_dy.value]) / 1000
         return float(cx), float(cy), float(yaw), side, method
 
     def measure_plate(frames: int = 6, full_only: bool = False) -> tuple[float, float, float, float] | None:

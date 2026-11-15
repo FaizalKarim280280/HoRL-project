@@ -7,3 +7,8 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# Recorded datasets and LeRobot outputs (large; kept local)
+A2/data/
+A2/snapshots/
+outputs/
