@@ -5,12 +5,12 @@ Same task as before: pick up the red cube and place it in the blue tray. This ti
 - **Recording** uses our own fast recorder. It saves raw JPEGs and joint data, with no video encoding while recording.
 - **Conversion** happens once, afterwards, into a standard LeRobot dataset for training ACT, which is the next step.
 
-Ports and arm ids come from `../scripts/common.sh`. Everything else is set in [`scripts/config.sh`](scripts/config.sh). All scripts and settings are in `scripts/`; run them from the `A2` folder (e.g. `scripts/02_record.sh`) with the `lerobot` conda env active.
+Ports and arm ids come from `../common/robot.sh`. Everything else is set in [`scripts/config.sh`](scripts/config.sh). All scripts and settings are in `scripts/`; run them from the `A2` folder (e.g. `scripts/02_record.sh`) with the `lerobot` conda env active.
 
 ## 1. Set up the cameras (once)
 
 1. Plug in both cameras and fix the scene camera rigidly. It must see the whole workspace: every place where the cube and the tray will be, and the arm.
-2. Run `scripts/00_find_cameras.sh` to list the cameras. In `scripts/config.sh`, `WRIST_CAMERA` (`1080p`, set in `common.sh`) and `SCENE_CAMERA` (`720P`) pick them by part of their name.
+2. Run `scripts/00_find_cameras.sh` to list the cameras. In `scripts/config.sh`, `WRIST_CAMERA` (`1080p`, set in `../common/robot.sh`) and `SCENE_CAMERA` (`720P`) pick them by part of their name.
 3. Run `scripts/01_view_cameras.sh` to see both cameras live, side by side (`g` grid, `s` snapshot, `q` quit). Aim the scene camera so the cube, the tray and the gripper are always in view.
 
 **Don't move the scene camera** after you start recording. The policy learns from that exact viewpoint.
@@ -59,6 +59,25 @@ scripts/06_dataset_summary.sh       # episodes, frames, lengths (raw and convert
 scripts/04_view_episode.sh 3        # play episode 3 of the converted dataset (videos + joint plots)
 scripts/05_replay_episode.sh 3      # replay episode 3 on the follower (the arm moves)
 ```
+
+## 5. Merge batches, train, run a policy
+
+```bash
+scripts/08_merge.sh so101_pick_place_all so101_pick_place so101_pick_place_b2   # merge converted datasets
+```
+Training runs on a GPU machine (`lerobot-train`, dataset via the Hugging Face Hub); checkpoints come back into
+`outputs/train/`. To run one on the arm, with a camera window:
+```bash
+N_ACTION_STEPS=40 scripts/07_run_policy.sh outputs/train/<run>/<step>/pretrained_model
+```
+Keys in the window: `SPACE` start / pause, `r` back to the demos' start pose, `q` quit. Options (environment
+variables): `N_ACTION_STEPS` (default half the chunk), `MAX_STEP_DEG` (arm step limit, default 0.75),
+`MAX_STEP_GRIPPER` (default none), `ENSEMBLE`, `INTERP`, `DURATION`.
+
+## 6. Task 1 evaluation
+
+Code, plan and keys: [`eval/README.md`](eval/README.md). Results, with every reported table and figure:
+[`results/task1/README.md`](results/task1/README.md).
 
 ## Tips for good demonstrations
 

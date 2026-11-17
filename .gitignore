@@ -12,3 +12,4 @@ __pycache__/
 A2/data/
 A2/snapshots/
 outputs/
+A2/results/task1/rollouts/

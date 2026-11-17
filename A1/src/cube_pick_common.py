@@ -1,10 +1,8 @@
 """Shared code for the wrist-camera scripts: robot + camera + viser station, red-cube detection,
 grasp poses, inverse kinematics and smooth motions for the SO-101 follower."""
 
-import json
 import math
-import platform
-import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -17,12 +15,15 @@ import yourdfpy
 from viser.extras import ViserUrdf
 from viser.transforms import SO3
 
-from lerobot.cameras.opencv import OpenCVCameraConfig
-from lerobot.model.kinematics import RobotKinematics
-from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-from lerobot.utils.robot_utils import precise_sleep
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common"))
+from camera_lookup import resolve_camera  # noqa: E402  (shared with A2; re-exported for the A1 scripts)
 
-ROOT = Path(__file__).resolve().parent.parent  # workspace root: src/, scripts/, assets/, calibration/, notebooks/, data/, lerobot/
+from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: E402
+from lerobot.model.kinematics import RobotKinematics  # noqa: E402
+from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig  # noqa: E402
+from lerobot.utils.robot_utils import precise_sleep  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent  # A1/: src/, scripts/, assets/, calibration/, notebooks/, data/
 ASSETS_DIR = ROOT / "assets"
 CALIB_DIR = ROOT / "calibration"
 DEFAULT_URDF = ASSETS_DIR / "SO101" / "so101_new_calib.urdf"
@@ -41,43 +42,7 @@ MAX_ROT_SPEED_DEG_S = 40.0
 GRIPPER_SPEED = 40.0  # gripper units (0..100) per second
 
 
-# --- camera selection -------------------------------------------------------------------------
-
-
-def list_cameras_macos() -> list[str]:
-    """Camera names in OpenCV's index order on macOS.
-
-    OpenCV's AVFoundation backend numbers cameras by sorting them on their system unique ID
-    (so external USB cameras, "0x...", usually come before the built-in "6C70..." one).
-    system_profiler gives the same names and unique IDs, so sorting them the same way
-    reproduces OpenCV's indices.
-    """
-    out = subprocess.run(["system_profiler", "SPCameraDataType", "-json"], capture_output=True, text=True, check=True)
-    cams = json.loads(out.stdout).get("SPCameraDataType", [])
-    return [c["_name"] for c in sorted(cams, key=lambda c: c.get("spcamera_unique-id", ""))]
-
-
-def resolve_camera(spec: str) -> int | str:
-    """Camera setting -> OpenCV index_or_path.
-
-    A number is used as-is, an existing file path (e.g. /dev/video0) too; anything else is a
-    camera NAME (case-insensitive substring, e.g. "Innomaker"), looked up so the script always
-    opens that camera even if macOS renumbers them - never silently a different one.
-    """
-    if spec.isdigit():
-        return int(spec)
-    if Path(spec).exists():
-        return spec
-    if platform.system() != "Darwin":
-        raise ValueError(f"Camera name lookup is only implemented on macOS; use an index or /dev/video path, not {spec!r}")
-    names = list_cameras_macos()
-    matches = [i for i, name in enumerate(names) if spec.lower() in name.lower()]
-    if len(matches) != 1:
-        found = ", ".join(f"{i}: {n}" for i, n in enumerate(names)) or "none"
-        raise RuntimeError(f"Camera {spec!r} matched {len(matches)} cameras (found {found}). Is it plugged in?")
-    print(f"Camera {spec!r} -> OpenCV index {matches[0]} ({names[matches[0]]})")
-    return matches[0]
-
+# --- camera selection (shared with A2: common/camera_lookup.py) --------------------------------
 
 # --- settings saved in the calibration file ------------------------------------------------
 

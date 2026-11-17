@@ -1,0 +1,5 @@
+variant,policy / executed,successes,failures,trials,success rate,90% Wilson CI
+F40,full / 40,18,11,29,0.62,"[0.47, 0.75]"
+F15,full / 15,13,16,29,0.45,"[0.31, 0.60]"
+H40,half / 40,7,22,29,0.24,"[0.14, 0.39]"
+H15,half / 15,5,24,29,0.17,"[0.09, 0.31]"

@@ -1,0 +1,19 @@
+{
+  "joints": [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper"
+  ],
+  "pose": [
+    -2.11,
+    -101.45,
+    95.74,
+    53.49,
+    -4.79,
+    2.67
+  ],
+  "n_demos": 147
+}

@@ -1,0 +1,7 @@
+A (first),B (second),successes A vs B,decision,favoured,trials per policy at first decision
+F40,F15,18 vs 13 (of 29),FailToDecide,inconclusive,
+F40,H40,18 vs 7 (of 29),AcceptNull,**F40**,22
+F40,H15,18 vs 5 (of 29),AcceptNull,**F40**,20
+F15,H40,13 vs 7 (of 29),FailToDecide,inconclusive,
+F15,H15,13 vs 5 (of 29),FailToDecide,inconclusive,
+H40,H15,7 vs 5 (of 29),FailToDecide,inconclusive,

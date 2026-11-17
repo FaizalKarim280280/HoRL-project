@@ -1,0 +1,82 @@
+# Pre-registered evaluation plan for Task 1 (cube placement).
+# Fill in the TODOs, run make_schedule.py, then COMMIT this file, configs.csv and schedule.csv BEFORE the
+# first counted trial. Nothing here may change after evaluation starts (the git history is the record).
+# Paths are relative to this folder (A2/eval).
+
+question: >
+  Does training ACT on twice as many demonstrations (all 147 episodes of v3 vs a random half, 73 episodes)
+  increase the cube-placement success rate, and does executing 40 instead of 15 of the 50 predicted actions
+  per chunk change the success rate?
+
+policies:   # both: ACT, chunk 50, no VAE, lr 3e-4, image augmentation, batch 64 x 2 GPUs, seed 285628,
+            # trained from scratch; the train_configs differ only in dataset.episodes. Both at step 45000.
+  full:
+    checkpoint: ../../outputs/train/act_c50_novae_scratch_v3_aug/act_c50_novae_scratch_v3_aug/checkpoints/045000/pretrained_model
+    data: hrl_A2_t1_v3, all 147 episodes
+  half:
+    checkpoint: ../../outputs/train/act_c50_novae_scratch_v3half_aug/045000/pretrained_model/pretrained_model
+    data: hrl_A2_t1_v3, random half, 73 episodes (33 / 20 / 20 of batches 1 / 2 / 3); list in half_episodes.json
+
+variants:   # what is evaluated: a policy + the number of actions executed per predicted chunk
+  F40: {policy: full, n_action_steps: 40}
+  F15: {policy: full, n_action_steps: 15}
+  H40: {policy: half, n_action_steps: 40}
+  H15: {policy: half, n_action_steps: 15}
+
+# Statistics (fixed before looking at any result)
+n_max: 30                 # matched initial configurations = trials per variant (120 rollouts in total)
+alpha_total: 0.10         # family-wise; split over the k(k-1)/2 = 6 pairs -> 0.0167 per pair
+step:
+  test: MirroredStepTest
+  inference_mode: ranking
+  alternative: P0LessThanP1
+  risk_budget: linear (default)
+  shuffle: false          # outcomes are used in their chronological (schedule) order
+  package: sequentialized_barnard_tests 0.0.9, github.com/TRI-ML/sequentialized_barnard_tests commit 3ae1623906f82fe472a352ed4a6b8e4a712f1f3d
+confidence_interval: 0.90 Wilson
+posterior: Beta(s + 1, n - s + 1)   # uniform Beta(1, 1) prior
+
+# Rollouts
+fps: 30
+timeout_s: 60             # a rollout still running at 60 s is a failure (timeout)
+max_step_deg: 0.75        # no ARM joint command may change by more than 0.75 deg between control steps (22.5 deg/s)
+max_step_gripper: 0       # no limit on the gripper: limiting it delayed grasps and the policy stalled (pre-testing)
+                          # chosen in pre-testing (smoothest behaviour); below the policy's median step (~1 deg), so it
+                          # also slows fast motions. Same for all variants; limited commands are logged per rollout.
+task: Pick up the red cube and place it in the blue tray.
+success: >
+  The cube is in the tray, the gripper has opened (released it) and the arm has moved up, even slightly.
+  The operator presses `s` at that moment; the time since the start is the completion time.
+stages:   # partial score = 0.25 per completed stage (reported separately, never passed to STEP)
+  - reach the cube
+  - grasp and lift the cube
+  - carry the cube above the tray
+  - place it in the tray, release and lift (= full success)
+invalid: >
+  A rollout is aborted as invalid (and the same trial repeated) only for causes outside the policy:
+  hardware or communication fault, a person touching the arm or scene, a wrong setup. The reason is logged.
+  Policy behaviour (e.g. knocking the cube away, a dangerous motion stopped by the operator) is a failure,
+  never invalid.
+
+# Initial configurations, sampled from where the demonstrations started (no tape): the cube and tray are
+# detected in the first scene-camera frame of every demo (same fixed camera for all batches); each config is a
+# cube and a tray target pose (image px + rotation) drawn uniformly over the area near the demos' start
+# positions, uniform rotations, sizes from the perspective (fitted on the demos), no overlap. At setup the targets are drawn on the live scene view and the
+# rollout can start only when both detected objects are within tolerance; the measured poses are logged.
+seed: 2026
+n_pilot_configs: 4        # extra configurations for practice trials, logged separately, never counted
+configurations:
+  sample_from:
+    - ../../data/raw/so101_pick_place
+    - ../../data/raw/so101_pick_place_b2
+    - ../../data/raw/so101_pick_place_b3
+  near_demo_px: 40        # a target centre must lie within this distance of a demo's start position
+  min_gap_px: 20          # free space between the cube and the tray edge
+  tolerance_px: 10        # setup tolerance for each centre (~0.5 cm; the 2.5 cm cube is ~35-60 px wide)
+  tolerance_deg: 10       # setup tolerance for each rotation
+
+# Every rollout starts from the same home pose: the median start pose of these demonstrations.
+home_pose_from:
+  - ../../data/raw/so101_pick_place
+  - ../../data/raw/so101_pick_place_b2
+  - ../../data/raw/so101_pick_place_b3

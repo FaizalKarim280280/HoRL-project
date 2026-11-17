@@ -1,0 +1,19 @@
+# Post-hoc corrections to eval_log.csv, made after all 120 trials were run (2026-11-17).
+# The raw log is left exactly as recorded; analysis.load() applies these and the report lists them.
+
+relabel:
+  - rollout_id: r0065
+    trial: 61
+    variant: H15
+    set: {success: 1, stages_completed: 4, progress: 1.0, end_reason: success, failure_stage: ""}
+    reason: >
+      Labelling mistake by the operator: the rollout met the full success criterion but was ended with
+      `f` (failure, 2 stages). The completion time was not recorded (time_to_success left empty), so this
+      success is excluded from the completion-time statistics.
+
+exclude_trials:
+  trials: [117, 118, 119, 120]
+  reason: >
+    Block 30 (config cfg05, one rollout of each variant) excluded: an error during this last block
+    (reported by the operator; all four were started with the setup override and trial 118 ended after
+    0.06 s). Removing the whole block keeps the design matched: 29 configurations x 4 variants.

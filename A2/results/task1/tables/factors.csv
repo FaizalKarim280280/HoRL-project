@@ -1,0 +1,5 @@
+group,successes,trials,success rate,90% Wilson CI,mean progress
+full data (F40+F15),31,58,0.534,"[0.43, 0.64]",0.664
+half data (H40+H15),12,58,0.207,"[0.13, 0.31]",0.366
+execute 40 (F40+H40),25,58,0.431,"[0.33, 0.54]",0.556
+execute 15 (F15+H15),18,58,0.31,"[0.22, 0.42]",0.474

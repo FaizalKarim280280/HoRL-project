@@ -1,0 +1,5 @@
+variant,analysed trials,invalid (repeated),setup overrides,cube setup error px (median),tray setup error px (median),camera shift px (median),loop Hz (mean),slow frames (mean),limited cmds / rollout
+F40,29,1,18,8.2,9.2,36.8,29.6,1.2,438
+F15,29,0,15,7.9,7.3,36.9,29.4,6.8,403
+H40,29,1,16,7.9,8.1,36.9,29.7,1.2,360
+H15,29,0,16,7.8,8.6,36.9,29.4,4.7,322

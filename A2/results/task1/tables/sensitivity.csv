@@ -1,0 +1,5 @@
+case,F40,F15,H40,H15,pairs separated,CLD
+both corrections (reported),18/29,13/29,7/29,5/29,"F40 > H40, F40 > H15",F40:a F15:ab H40:b H15:b
+no corrections (raw log),18/30,13/30,7/30,4/30,"F40 > H40, F40 > H15",F40:a F15:ab H40:b H15:b
+relabel only,18/30,13/30,7/30,5/30,"F40 > H40, F40 > H15",F40:a F15:ab H40:b H15:b
+exclusion only,18/29,13/29,7/29,4/29,"F40 > H40, F40 > H15",F40:a F15:ab H40:b H15:b

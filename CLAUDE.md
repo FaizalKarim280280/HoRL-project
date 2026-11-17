@@ -2,7 +2,7 @@
 
 SO-101 arm projects for a robot-learning course (HRL). Two assignments share this repo:
 
-- **Assignment 1 (root):** classical wrist-camera pick and place: find a red cube, grasp it, drop it in a blue tray. Hand-eye calibrated camera, colour detection, IK. Done.
+- **Assignment 1 (`A1/`):** classical wrist-camera pick and place: find a red cube, grasp it, drop it in a blue tray. Hand-eye calibrated camera, colour detection, IK. Done.
 - **A2 (`A2/`):** learn the same task from teleoperated demonstrations with ACT. Assignment text: `A2/HRL Assignment 2.pdf` (Task 1: compare >= 2 policies/configs, >= 25 matched eval rollouts each, STEP `MirroredStepTest`, 90% Wilson CIs, log all demos and evals).
 
 ## Environment
@@ -14,8 +14,8 @@ SO-101 arm projects for a robot-learning course (HRL). Two assignments share thi
 
 ## Hardware
 
-- Follower and leader ports and ids: `scripts/common.sh` (single source of machine-specific settings).
-- Cameras are chosen by **name**, never by index (the MacBook webcam must not open): wrist = `"1080p"` (Innomaker U20CAM-1080p), scene = `"720P"`. Resolved via `src/cube_pick_common.resolve_camera`.
+- Ports, arm ids and the wrist camera name: `common/robot.sh` (single source, shared by A1 and A2).
+- Cameras are chosen by **name**, never by index (the MacBook webcam must not open): wrist = `"1080p"` (Innomaker U20CAM-1080p), scene = `"720P"`. Resolved via `common/camera_lookup.resolve_camera`.
 - Scripts turn torque off on exit, so the follower goes limp: warn the user to support it.
 - Never move the arm (or run anything that does) without the user asking.
 
@@ -23,13 +23,13 @@ SO-101 arm projects for a robot-learning course (HRL). Two assignments share thi
 
 | Path | Contents |
 |---|---|
-| `scripts/` | Assignment-1 launchers (`NN_name.sh`), all sourcing `common.sh` |
-| `src/` | Assignment-1 Python: calibration, detection (`wrist_vision.py`, `plate_detection.py`), `pick_red_cube_wrist.py` (viser UI at :8080) |
-| `calibration/` | Camera intrinsics, hand-eye result, colour thresholds |
-| `report/` | Assignment-1 report and evaluation Q&A |
-| `A2/scripts/` | A2 launchers `00_`-`06_` + `config.sh` (dataset name, cameras, task) and their Python |
+| `common/` | Shared by A1 and A2: `robot.sh` (ports, ids, wrist camera), `camera_lookup.py` |
+| `A1/` | Assignment 1, classical pick and place: `scripts/` (launchers, `common.sh` = A1 settings), `src/`, `calibration/`, `assets/` (URDF, ChArUco), `notebooks/`, `report/` |
+| `A2/scripts/` | A2 launchers `00_`-`08_` + `config.sh`; `run_policy.py` (inference with camera window) |
+| `A2/eval/` | Task 1 evaluation: `plan/` (pre-registered), `evaluate.py`, `analysis.py`, `export_results.py` |
+| `A2/results/task1/` | Final Task 1 results: README (report sections), logs + manifest, rollouts (git-ignored), tables, figures |
 | `A2/notebooks/inspect_demos.ipynb` | Demonstration quality checks |
-| `A2/data/` | Recordings (git-ignored): `raw/<name>/` and `lerobot/<name>/` |
+| `A2/data/`, `A2/outputs/` | Recordings and checkpoints (git-ignored) |
 
 ## A2 data pipeline
 

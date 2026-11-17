@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Camera names <-> OpenCV indices (macOS), reusing the lookup from src/cube_pick_common.py.
+"""Camera names <-> OpenCV indices (macOS), using the shared lookup in common/camera_lookup.py.
 
     python cameras.py list          # every camera with its OpenCV index
     python cameras.py index NAME    # the index of the one camera whose name contains NAME
@@ -9,8 +9,8 @@ import contextlib
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from cube_pick_common import list_cameras_macos, resolve_camera  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common"))
+from camera_lookup import list_cameras_macos, resolve_camera  # noqa: E402
 
 
 def main() -> None:

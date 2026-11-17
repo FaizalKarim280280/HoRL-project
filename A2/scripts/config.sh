@@ -1,12 +1,12 @@
 # Settings for the A2 demonstration scripts. Ports, arm ids and the wrist camera come from
-# the workspace's scripts/common.sh; everything specific to the dataset is here.
+# common/robot.sh (shared with A1); everything specific to the dataset is here.
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # A2/scripts
 A2_DIR="$(dirname "$SCRIPTS_DIR")"                           # A2
-source "$A2_DIR/../scripts/common.sh"
+source "$A2_DIR/../common/robot.sh"
 
 # Cameras, chosen by NAME (case-insensitive part of it) so they keep working when macOS renumbers
 # them; an OpenCV index also works. ./00_find_cameras.sh lists the names.
-WRIST_CAMERA="$WRIST_CAMERA_INDEX"   # from common.sh ("1080p")
+WRIST_CAMERA="$WRIST_CAMERA_INDEX"   # from common/robot.sh ("1080p")
 SCENE_CAMERA="720P"                  # scene camera (Innomaker U20CAM-720P, looking down at the table)
 CAMERA_WIDTH=640
 CAMERA_HEIGHT=480

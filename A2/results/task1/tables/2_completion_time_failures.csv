@@ -1,0 +1,5 @@
+variant,failed trials,timeout at 60 s,stopped by operator (time)
+F40,11,3,"8 (median 32.8 s, range 14.4–59.0 s)"
+F15,16,1,"15 (median 30.4 s, range 13.5–43.5 s)"
+H40,22,1,"21 (median 30.1 s, range 15.7–59.6 s)"
+H15,24,0,"24 (median 21.3 s, range 15.5–47.7 s)"

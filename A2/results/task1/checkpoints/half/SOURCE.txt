@@ -1,0 +1,2 @@
+Weights: outputs/train/act_c50_novae_scratch_v3half_aug/045000/pretrained_model/pretrained_model/model.safetensors (+ processor files)
+Data: hrl_A2_t1_v3, random half, 73 episodes (33 / 20 / 20 of batches 1 / 2 / 3); list in half_episodes.json

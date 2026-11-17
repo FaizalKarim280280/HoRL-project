@@ -17,8 +17,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from cube_pick_common import resolve_camera  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common"))
+from camera_lookup import resolve_camera  # noqa: E402
 
 
 def main() -> None:

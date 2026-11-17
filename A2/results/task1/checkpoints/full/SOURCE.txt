@@ -1,0 +1,2 @@
+Weights: outputs/train/act_c50_novae_scratch_v3_aug/act_c50_novae_scratch_v3_aug/checkpoints/045000/pretrained_model/model.safetensors (+ processor files)
+Data: hrl_A2_t1_v3, all 147 episodes
