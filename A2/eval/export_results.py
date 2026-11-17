@@ -266,6 +266,9 @@ each run with two execution horizons:
 | **H40** | Half data, execute 40 | random half, 73 demonstrations | 40 |
 | **H15** | Half data, execute 15 | random half, 73 demonstrations | 15 |
 
+**Training data.** All 147 demonstrations: [faizalkarim/hrl_A2_t1_v3](https://huggingface.co/datasets/faizalkarim/hrl_A2_t1_v3)
+(LeRobot v3 dataset; the half-data policy's 73 episodes are listed in `plan/half_episodes.json`).
+
 **Online.** This folder with every rollout video (wrist + scene, plays in the browser):
 [{publish.RESULTS_REPO}](https://huggingface.co/datasets/{publish.RESULTS_REPO}), under `rollouts/<id>/`.
 `logs/manifest.csv` gives each rollout's variant, configuration and outcome with direct video links (`url_wrist`, `url_scene`).

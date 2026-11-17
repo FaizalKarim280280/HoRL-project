@@ -65,6 +65,7 @@ scripts/05_replay_episode.sh 3      # replay episode 3 on the follower (the arm 
 ```bash
 scripts/08_merge.sh so101_pick_place_all so101_pick_place so101_pick_place_b2   # merge converted datasets
 ```
+The final training set (147 demonstrations, 3 batches) is public: [faizalkarim/hrl_A2_t1_v3](https://huggingface.co/datasets/faizalkarim/hrl_A2_t1_v3).
 Training runs on a GPU machine (`lerobot-train`, dataset via the Hugging Face Hub); checkpoints come back into
 `outputs/train/`. To run one on the arm, with a camera window:
 ```bash

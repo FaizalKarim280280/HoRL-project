@@ -13,6 +13,9 @@ each run with two execution horizons:
 | **H40** | Half data, execute 40 | random half, 73 demonstrations | 40 |
 | **H15** | Half data, execute 15 | random half, 73 demonstrations | 15 |
 
+**Training data.** All 147 demonstrations: [faizalkarim/hrl_A2_t1_v3](https://huggingface.co/datasets/faizalkarim/hrl_A2_t1_v3)
+(LeRobot v3 dataset; the half-data policy's 73 episodes are listed in `plan/half_episodes.json`).
+
 **Online.** This folder with every rollout video (wrist + scene, plays in the browser):
 [faizalkarim/hrl_A2_task1_results](https://huggingface.co/datasets/faizalkarim/hrl_A2_task1_results), under `rollouts/<id>/`.
 `logs/manifest.csv` gives each rollout's variant, configuration and outcome with direct video links (`url_wrist`, `url_scene`).
@@ -136,4 +139,4 @@ from the STEP decisions: F40 `a`, F15 `ab`, H40 `b`, H15 `b`. Variants sharing a
 - **Files:** `logs/manifest.csv` (one row per rollout: trial, configuration, variant, policy, success, partial score,
   times, video paths), `logs/eval_log.csv` (raw), `logs/demos_batch1-3.csv`, `rollouts/<id>/` (wrist + scene video,
   joint data), `plan/`, `checkpoints/`, `tables/` (every table as CSV), `figures/`. Regenerate with
-  `eval/03_export_results.sh`. lerobot 0.6.2, torch 2.11.0, commit 1ec16b3.
+  `eval/03_export_results.sh`. lerobot 0.6.2, torch 2.11.0, commit 241fbe3.
